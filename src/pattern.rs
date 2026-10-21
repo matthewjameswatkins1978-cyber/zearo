@@ -383,6 +383,12 @@ impl Sequencer {
                     Msg::Audition { asset } => {
                         engine.audition(asset);
                     }
+                    Msg::Release { target, note } => {
+                        engine.release(target, note);
+                    }
+                    Msg::ReleaseAll => {
+                        engine.release_all();
+                    }
                 }
             }
             let (l, r) = engine.render_frame();

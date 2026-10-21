@@ -267,6 +267,14 @@ pub enum Msg {
     Audition {
         asset: AssetId,
     },
+    /// Damp ringing voices for a note-off. Short one-shots end on their
+    /// own, so this only shortens sustains — stuck notes are impossible.
+    Release {
+        target: TargetId,
+        note: u8,
+    },
+    /// Damp every ringing voice (panic button, device disconnect).
+    ReleaseAll,
 }
 
 // ---------------------------------------------------------------------------
@@ -292,6 +300,10 @@ struct Voice {
     decay_k: f32,
     elapsed: f32,
     choke: Option<u8>,
+    target: TargetId,
+    note: u8,
+    /// Seconds since note-off; negative while sustaining.
+    rel_t: f32,
     age: u64,
 }
 
@@ -306,6 +318,9 @@ impl Voice {
             decay_k: 0.0,
             elapsed: 0.0,
             choke: None,
+            target: TargetId(u32::MAX),
+            note: 0,
+            rel_t: -1.0,
             age: 0,
         }
     }
@@ -339,6 +354,17 @@ pub struct Engine {
     /// Asset rate (44.1 kHz) over device rate: keeps pitch right on 48 kHz
     /// devices without resampling the immutable assets.
     rate_factor: f32,
+}
+
+/// Voice spawn parameters (bundled: one voice carries a lot of state).
+struct NewVoice {
+    buf: Arc<Vec<f32>>,
+    rate: f32,
+    gain: f32,
+    decay: f32,
+    choke: Option<u8>,
+    target: TargetId,
+    note: u8,
 }
 
 impl Engine {
@@ -495,7 +521,15 @@ impl Engine {
             };
             (take, rate, level, decay)
         };
-        self.start_voice(take, rate, gain_of(level, velocity), decay, choke);
+        self.start_voice(NewVoice {
+            buf: take,
+            rate,
+            gain: gain_of(level, velocity),
+            decay,
+            choke,
+            target,
+            note,
+        });
         true
     }
 
@@ -513,35 +547,62 @@ impl Engine {
             Some(buf) => buf,
             None => return false,
         };
-        self.start_voice(buf, 1.0, 0.9, 1.0, None);
+        self.start_voice(NewVoice {
+            buf,
+            rate: 1.0,
+            gain: 0.9,
+            decay: 1.0,
+            choke: None,
+            target: TargetId(u32::MAX),
+            note: 60,
+        });
         true
     }
 
+    /// Damp ringing voices matching a note-off. Short one-shots end on
+    /// their own, so stuck notes are impossible — this only shortens tails
+    /// musically (~100 ms fade). Returns true if anything was ringing.
+    pub fn release(&mut self, target: TargetId, note: u8) -> bool {
+        let mut released = false;
+        for voice in self.voices.iter_mut().filter(|v| v.active) {
+            if voice.target == target && voice.note == note && voice.rel_t < 0.0 {
+                voice.rel_t = 0.0;
+                released = true;
+            }
+        }
+        released
+    }
+
+    /// Damp every ringing voice (panic button, device disconnect).
+    pub fn release_all(&mut self) {
+        for voice in self.voices.iter_mut().filter(|v| v.active) {
+            if voice.rel_t < 0.0 {
+                voice.rel_t = 0.0;
+            }
+        }
+    }
+
     /// Start one voice on a concrete buffer.
-    fn start_voice(
-        &mut self,
-        buf: Arc<Vec<f32>>,
-        rate: f32,
-        gain: f32,
-        decay: f32,
-        choke: Option<u8>,
-    ) {
+    fn start_voice(&mut self, v: NewVoice) {
         let i = self.free_voice_index();
         self.age = self.age.wrapping_add(1);
-        let decay_k = if decay >= 1.0 {
+        let decay_k = if v.decay >= 1.0 {
             0.0
         } else {
-            3.0 * (1.0 / decay - 1.0)
+            3.0 * (1.0 / v.decay - 1.0)
         };
         let voice = &mut self.voices[i];
         voice.active = true;
-        voice.buf = Some(buf);
+        voice.buf = Some(v.buf);
         voice.pos = 0.0;
-        voice.rate = rate * self.rate_factor;
-        voice.gain = gain;
+        voice.rate = v.rate * self.rate_factor;
+        voice.gain = v.gain;
         voice.decay_k = decay_k;
         voice.elapsed = 0.0;
-        voice.choke = choke;
+        voice.choke = v.choke;
+        voice.target = v.target;
+        voice.note = v.note;
+        voice.rel_t = -1.0;
         voice.age = self.age;
     }
 
@@ -562,13 +623,17 @@ impl Engine {
                     let s = buf[i] * (1.0 - frac) + buf[i + 1] * frac;
                     voice.pos += voice.rate;
                     voice.elapsed += 1.0 / self.sample_rate;
-                    let env = if voice.decay_k > 0.0 {
+                    let mut env = if voice.decay_k > 0.0 {
                         (-voice.elapsed * voice.decay_k).exp()
                     } else {
                         1.0
                     };
+                    if voice.rel_t >= 0.0 {
+                        voice.rel_t += 1.0 / self.sample_rate;
+                        env *= (-voice.rel_t * 80.0).exp();
+                    }
                     mix += s * voice.gain * env;
-                    false
+                    voice.rel_t >= 0.25
                 }
             };
             if done {
@@ -803,6 +868,87 @@ mod tests {
         let inst = snare9(&pool);
         let full = render_hit(&inst, &pool, TargetId(0), 60, 90, 15_435);
         assert!(energy(&short) < energy(&full) * 0.8, "decay shortens");
+    }
+
+    #[test]
+    fn note_off_damps_ringing_voices() {
+        let pool = AssetPool::generate();
+        let inst = pitched_pluck(&pool);
+        let prepared = Arc::new(prepare(&inst, &pool, 1).expect("prepares"));
+        let (mut engine, mut rx) = Engine::new(prepared, 44100.0);
+        assert!(engine.trigger(TargetId(0), 60, 100));
+        let mut head = vec![0.0; 4410];
+        let mut head2 = vec![0.0; 4410];
+        engine.render_block(&mut head, &mut head2);
+        assert_eq!(engine.active_voices(), 1, "pluck still ringing at 0.1 s");
+        assert!(engine.release(TargetId(0), 60), "release lands");
+        assert!(
+            !engine.release(TargetId(0), 61),
+            "wrong note releases nothing"
+        );
+        assert!(
+            !engine.release(TargetId(7), 60),
+            "unknown target releases nothing"
+        );
+        let mut tail = vec![0.0; 22_050];
+        let mut tail2 = vec![0.0; 22_050];
+        engine.render_block(&mut tail, &mut tail2);
+        assert_eq!(engine.active_voices(), 0, "released voice ends early");
+        assert_eq!(drain_retired(&mut rx), 1, "buffer retires normally");
+        assert_eq!(engine.retired_dropped, 0);
+        // Control: without release the 1.4 s pluck still rings at 0.6 s.
+        let prepared2 = Arc::new(prepare(&inst, &pool, 2).expect("prepares"));
+        let (mut control, _rx2) = Engine::new(prepared2, 44100.0);
+        assert!(control.trigger(TargetId(0), 60, 100));
+        let mut c1 = vec![0.0; 26_460];
+        let mut c2 = vec![0.0; 26_460];
+        control.render_block(&mut c1, &mut c2);
+        assert_eq!(control.active_voices(), 1, "unreleased pluck still rings");
+    }
+
+    #[test]
+    fn release_only_touches_matching_voices() {
+        let pool = AssetPool::generate();
+        let inst = percussion_kit(&pool);
+        let prepared = Arc::new(prepare(&inst, &pool, 1).expect("prepares"));
+        let (mut engine, _rx) = Engine::new(prepared, 44100.0);
+        // Crash and tom share note 60; only the crash target may damp.
+        assert!(engine.trigger(TargetId(9), 60, 100));
+        assert!(engine.trigger(TargetId(5), 60, 100));
+        let mut head = vec![0.0; 100];
+        let mut head2 = vec![0.0; 100];
+        engine.render_block(&mut head, &mut head2);
+        assert!(engine.release(TargetId(9), 60));
+        // 0.34 s: past the ~0.25 s release fade, inside the tom's tail.
+        let mut mid = vec![0.0; 15_000];
+        let mut mid2 = vec![0.0; 15_000];
+        engine.render_block(&mut mid, &mut mid2);
+        let ringing: Vec<u32> = engine
+            .voices
+            .iter()
+            .filter(|v| v.active)
+            .map(|v| v.target.0)
+            .collect();
+        assert_eq!(ringing, vec![5], "crash damped, tom still rings");
+    }
+
+    #[test]
+    fn release_all_silences_everything() {
+        let pool = AssetPool::generate();
+        let inst = percussion_kit(&pool);
+        let prepared = Arc::new(prepare(&inst, &pool, 1).expect("prepares"));
+        let (mut engine, mut rx) = Engine::new(prepared, 44100.0);
+        for t in [0u32, 1, 2] {
+            assert!(engine.trigger(TargetId(t), 60, 100));
+        }
+        assert_eq!(engine.active_voices(), 3);
+        engine.release_all();
+        let mut tail = vec![0.0; 22_050];
+        let mut tail2 = vec![0.0; 22_050];
+        engine.render_block(&mut tail, &mut tail2);
+        assert_eq!(engine.active_voices(), 0);
+        assert_eq!(drain_retired(&mut rx), 3);
+        assert_eq!(engine.retired_dropped, 0);
     }
 
     #[test]

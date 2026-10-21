@@ -17,6 +17,7 @@ use crate::audio::{self, LiveTrack, RunningAudio};
 use crate::engine::{drain_retired, prepare, Engine, Msg, Shared};
 use crate::instrument::{percussion_kit, pitched_pluck, snare9, Instrument, TargetId};
 use crate::layout::{Layout, PadAction};
+use crate::midi::{self, MidiBridge};
 use crate::pattern::{LiveViews, Pattern, Sequencer};
 use crate::sample::{AssetId, AssetPool};
 use crate::song::{self, Song};
@@ -193,6 +194,8 @@ pub struct ZearoApp {
     replace_asset: String,
     started: std::time::Instant,
     flash: HashMap<TargetId, (f64, u8)>,
+    midi: Option<MidiBridge>,
+    midi_status: String,
 }
 
 impl Default for ZearoApp {
@@ -226,6 +229,8 @@ impl ZearoApp {
             replace_asset: "rim".to_string(),
             started: std::time::Instant::now(),
             flash: HashMap::new(),
+            midi: None,
+            midi_status: "MIDI: not connected".to_string(),
         };
         match audio::start_multi(live, views) {
             Ok(running) => {
@@ -243,6 +248,7 @@ impl ZearoApp {
                 app.audio_error = Some(format!("audio unavailable: {e}"));
             }
         }
+        app.midi_connect();
         app
     }
 
@@ -287,6 +293,19 @@ impl ZearoApp {
             }
         }
         song
+    }
+
+    /// (Re)connect the KeyStep (or first available input). Never panics;
+    /// a missing device just reports status — the app keeps working.
+    fn midi_connect(&mut self) {
+        self.midi = None;
+        match MidiBridge::connect_keystep_or_first() {
+            Ok(bridge) => {
+                self.midi_status = format!("MIDI: {}", bridge.port_name());
+                self.midi = Some(bridge);
+            }
+            Err(e) => self.midi_status = format!("MIDI: {e}"),
+        }
     }
 
     fn save(&mut self) {
@@ -391,6 +410,44 @@ impl eframe::App for ZearoApp {
         let now = ui.input(|i| i.time);
         for h in self.handles.iter_mut() {
             h.retired += drain_retired(&mut h.retire_rx) as u64;
+        }
+        // MIDI input: parsed + mapped on the UI thread so the single
+        // audio-queue producer stays single. Plays and records like pads.
+        if self.midi.is_some() {
+            let mut raw = Vec::new();
+            if let Some(bridge) = self.midi.as_mut() {
+                raw = bridge.poll();
+            }
+            let mut played: Vec<(bool, TargetId, u8, u8)> = Vec::new();
+            if let Some(inst) = self.active_instrument() {
+                for event in &raw {
+                    match event {
+                        midi::MidiEvent::NoteOn { note, velocity } => {
+                            if let Some((t, n, v)) = midi::map_note(inst, *note, *velocity) {
+                                played.push((true, t, n, v));
+                            }
+                        }
+                        midi::MidiEvent::NoteOff { note } => {
+                            if let Some((t, n)) = midi::map_release(inst, *note) {
+                                played.push((false, t, n, 0));
+                            }
+                        }
+                    }
+                }
+            }
+            for (on, target, note, velocity) in played {
+                if on {
+                    self.send(Msg::Hit {
+                        target,
+                        note,
+                        velocity,
+                    });
+                    self.flash.insert(target, (now, velocity));
+                    self.selected = Some(target);
+                } else {
+                    self.send(Msg::Release { target, note });
+                }
+            }
         }
         self.flash.retain(|_, (t, _)| now - *t < 0.4);
 
@@ -546,6 +603,21 @@ impl eframe::App for ZearoApp {
             }
             ui.label(format!("· {}", self.status));
             ui.label(format!("· up {:.0}s", self.started.elapsed().as_secs_f32()));
+        });
+        ui.horizontal(|ui| {
+            ui.label(&self.midi_status);
+            if ui.button("MIDI rescan").clicked() {
+                self.midi_connect();
+            }
+            if ui.button("Panic").clicked() {
+                self.send_all(Msg::ReleaseAll);
+                self.send_all(Msg::SetArmed {
+                    armed: false,
+                    overdub: false,
+                });
+                self.rec = false;
+                self.odub = false;
+            }
         });
         ui.ctx().request_repaint();
     }

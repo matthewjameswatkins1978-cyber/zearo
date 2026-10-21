@@ -51,14 +51,16 @@ cargo clippy --all-targets -- -D warnings
 cargo build --locked
 cargo test --locked
 cargo bench --locked -- --test   # compiles benches, one quick pass each
-cargo run --locked --quiet       # headless probe; no hardware required
-cargo run --locked --quiet -- --ui  # opens the workbench window (needs a display)
+cargo run --locked --quiet -- --probe  # devices only, no hardware needed
+cargo run --locked --quiet -- --demo 2  # 2 bars on the preferred output
+cargo run --locked                      # desktop app (grid + recording)
 ```
 
-`cargo run` enumerates audio/MIDI devices but never opens a stream, so empty
-device lists on headless machines are fine. Real stream I/O and audible
-output are unverified by design here — they need hardware + ears, and belong
-to the first-playable milestone, not the workbench.
+`--probe` never opens a stream, so empty device lists on headless machines
+are fine. `--demo` and the app open the preferred output (iD22 main pair
+when present; WASAPI) — verified 2026-10-21 on the real iD22 at 48 kHz
+with zero stream errors, and heard by Matthew. See `docs/LISTENING.md`
+for the human checklist and `docs/ARCHITECTURE.md` for the assessment.
 
 ## Linux ARM64 (Raspberry Pi) status
 

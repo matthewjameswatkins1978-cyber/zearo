@@ -65,6 +65,12 @@ pub enum Recipe {
         note: u8,
         band: u8,
     },
+    /// User audio (WAV import or input capture). The PCM lives in the song
+    /// document (`StoredSample`), never in generated code; the pool only
+    /// caches the prepared playback buffer.
+    Imported {
+        name: String,
+    },
 }
 
 /// One immutable generated sound.
@@ -176,6 +182,39 @@ impl AssetPool {
         self.assets.iter().find(|a| a.name == name).map(|a| a.id)
     }
 
+    /// Add user audio to the pool (already at the pool rate). Returns the
+    /// stable id the instrument takes will reference.
+    pub fn import(&mut self, name: &str, sample_rate: u32, pcm: Vec<f32>) -> AssetId {
+        let prepared = if sample_rate == SAMPLE_RATE {
+            pcm
+        } else {
+            resample_linear(&pcm, sample_rate, SAMPLE_RATE)
+        };
+        let id = AssetId(self.assets.len() as u32);
+        self.assets.push(Asset {
+            id,
+            name: name.to_string(),
+            recipe: Recipe::Imported {
+                name: name.to_string(),
+            },
+            pcm: Arc::new(prepared),
+        });
+        id
+    }
+
+    /// Replace an imported take's playback buffer. Trim edits re-derive
+    /// from the song's stored original; the original is never touched.
+    /// Refuses generated (immutable) ids.
+    pub fn replace_buffer(&mut self, id: AssetId, pcm: Vec<f32>) -> bool {
+        if let Some(asset) = self.assets.iter_mut().find(|a| a.id == id) {
+            if matches!(asset.recipe, Recipe::Imported { .. }) {
+                asset.pcm = Arc::new(pcm);
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn len(&self) -> usize {
         self.assets.len()
     }
@@ -284,6 +323,7 @@ pub fn render_recipe(recipe: &Recipe) -> Vec<f32> {
         Recipe::Tambourine { variant } => 0xC000 + u64::from(*variant),
         Recipe::Woodblock { high, variant } => 0xD000 + u64::from(*variant) * 2 + u64::from(*high),
         Recipe::Pluck { note, band } => 0x9000 + u64::from(*note) * 4 + u64::from(*band),
+        Recipe::Imported { .. } => 0xE000,
     });
 
     let mut out = match recipe {
@@ -482,6 +522,7 @@ pub fn render_recipe(recipe: &Recipe) -> Vec<f32> {
             }
             buf
         }
+        Recipe::Imported { .. } => vec![0.0; SAMPLE_RATE as usize],
         Recipe::Pluck { note, band } => {
             let dur = 1.4;
             let n = (dur * f64::from(sr)) as usize;
@@ -505,6 +546,129 @@ pub fn render_recipe(recipe: &Recipe) -> Vec<f32> {
     };
     apply_fades(&mut out);
     out
+}
+
+/// A prepared user take: device-rate mono PCM ready to play, with peak.
+pub struct PreparedTake {
+    pub pcm: Vec<f32>,
+    pub peak: f32,
+    pub sample_rate: u32,
+}
+
+/// Prepare a user recording for immediate playback: resample to the pool
+/// rate, trim silence with pre-roll/tail guards, peak-normalize, add
+/// click-safe boundary fades. The original is untouched — this only reads it.
+pub fn prepare_take(source_rate: u32, pcm: &[f32]) -> PreparedTake {
+    if pcm.is_empty() {
+        return PreparedTake {
+            pcm: Vec::new(),
+            peak: 0.0,
+            sample_rate: SAMPLE_RATE,
+        };
+    }
+    let mut buf = resample_linear(pcm, source_rate, SAMPLE_RATE);
+    let peak_in = buf.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+    if peak_in < 0.0032 {
+        return PreparedTake {
+            pcm: Vec::new(),
+            peak: 0.0,
+            sample_rate: SAMPLE_RATE,
+        };
+    }
+    trim_silence(&mut buf);
+    let mut peak = buf.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+    if peak > 1e-4 {
+        let gain = 0.89 / peak;
+        for s in buf.iter_mut() {
+            *s *= gain;
+        }
+        peak = 0.89;
+    }
+    apply_fades(&mut buf);
+    PreparedTake {
+        pcm: buf,
+        peak,
+        sample_rate: SAMPLE_RATE,
+    }
+}
+
+fn resample_linear(pcm: &[f32], from: u32, to: u32) -> Vec<f32> {
+    if from == to || pcm.is_empty() {
+        return pcm.to_vec();
+    }
+    let ratio = f64::from(to) / f64::from(from);
+    let n = ((pcm.len() as f64 * ratio).round() as usize).max(1);
+    (0..n)
+        .map(|i| {
+            let pos = i as f64 / ratio;
+            let j = pos.floor() as usize;
+            let frac = (pos - j as f64) as f32;
+            let a = pcm[j.min(pcm.len() - 1)];
+            let b = pcm[(j + 1).min(pcm.len() - 1)];
+            a * (1.0 - frac) + b * frac
+        })
+        .collect()
+}
+
+/// Trim digital silence, keeping 5 ms pre-roll and at least 50 ms of tail
+/// so attacks and reverb tails survive.
+fn trim_silence(buf: &mut Vec<f32>) {
+    const LEAD_DB: f32 = 0.01; // approx -40 dB
+    const TAIL_DB: f32 = 0.0032; // approx -50 dB
+    let sr = SAMPLE_RATE as usize;
+    let start = buf.iter().position(|s| s.abs() >= LEAD_DB).unwrap_or(0);
+    let start = start.saturating_sub(sr * 5 / 1000);
+    let mut last = buf.len();
+    while last > start && buf[last - 1].abs() < TAIL_DB {
+        last -= 1;
+    }
+    let end = (last + sr * 50 / 1000).min(buf.len());
+    if start >= end {
+        buf.clear();
+        return;
+    }
+    buf.drain(end..);
+    buf.drain(..start);
+}
+
+/// Read any PCM WAV (16/24/32-bit int or 32/64-bit float) and mix down to
+/// mono f32 in [-1, 1]. Returns (source_rate, samples).
+pub fn read_wav_mono(path: &str) -> Result<(u32, Vec<f32>), String> {
+    let mut reader = hound::WavReader::open(path).map_err(|e| e.to_string())?;
+    let spec = reader.spec();
+    if spec.channels == 0 {
+        return Err("WAV has no channels".to_string());
+    }
+    let ch = spec.channels as usize;
+    let mut mono: Vec<f32> = Vec::new();
+    match spec.sample_format {
+        hound::SampleFormat::Float => {
+            for s in reader.samples::<f32>() {
+                mono.push(s.map_err(|e| e.to_string())?);
+            }
+        }
+        hound::SampleFormat::Int => {
+            let bits = spec.bits_per_sample;
+            if !matches!(bits, 16 | 24 | 32) {
+                return Err(format!(
+                    "unsupported int bit depth {bits} (use 16/24/32-bit or float)"
+                ));
+            }
+            let scale = (1i64 << (bits - 1)) as f32;
+            for s in reader.samples::<i32>() {
+                mono.push(s.map_err(|e| e.to_string())? as f32 / scale);
+            }
+        }
+    }
+    if ch > 1 {
+        let frames = mono.len() / ch;
+        let mut mixed = vec![0.0f32; frames];
+        for (i, s) in mono.iter().enumerate().take(frames * ch) {
+            mixed[i / ch] += *s / ch as f32;
+        }
+        mono = mixed;
+    }
+    Ok((spec.sample_rate, mono))
 }
 
 /// Root-mean-square level.
@@ -542,6 +706,105 @@ mod tests {
             s.to_bits().hash(&mut h);
         }
         h.finish()
+    }
+
+    #[test]
+    fn prepare_trims_normalizes_and_fades() {
+        // 0.1 s silence + 0.5 s 440 Hz tone at 0.2 + 0.2 s silence.
+        let sr = SAMPLE_RATE as usize;
+        let mut buf = vec![0.0f32; (0.8 * SAMPLE_RATE as f32) as usize];
+        for i in 0..(0.5 * SAMPLE_RATE as f32) as usize {
+            let t = i as f32 / SAMPLE_RATE as f32;
+            buf[sr / 10 + i] = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.2;
+        }
+        let prep = prepare_take(SAMPLE_RATE, &buf);
+        // 0.5 s tone + 5 ms pre-roll + 50 ms tail, roughly.
+        let expect = (0.555 * SAMPLE_RATE as f32) as usize;
+        assert!(
+            (prep.pcm.len() as i64 - expect as i64).abs() < 600,
+            "len {}",
+            prep.pcm.len()
+        );
+        assert!((prep.peak - 0.89).abs() < 1e-6, "normalized");
+        assert!(
+            prep.pcm[0].abs() < 0.05 && prep.pcm[prep.pcm.len() - 1].abs() < 0.02,
+            "faded edges"
+        );
+    }
+
+    #[test]
+    fn prepare_handles_empty_silence_and_other_rates() {
+        let empty = prepare_take(44100, &[]);
+        assert!(empty.pcm.is_empty());
+        let silent = prepare_take(44100, &vec![0.0; 4410]);
+        assert!(silent.pcm.is_empty(), "silence trims to nothing");
+        let tone48: Vec<f32> = (0..48_000)
+            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 48000.0).sin() * 0.5)
+            .collect();
+        let prep = prepare_take(48000, &tone48);
+        assert!(
+            (prep.pcm.len() as i64 - 44100).abs() < 600,
+            "resampled len {}",
+            prep.pcm.len()
+        );
+        assert!((prep.peak - 0.89).abs() < 1e-4);
+    }
+
+    #[test]
+    fn wav_roundtrip_int_float_stereo() {
+        let dir = std::env::temp_dir();
+        let p16 = dir.join("zearo_test16.wav");
+        let spec16 = hound::WavSpec {
+            channels: 1,
+            sample_rate: 44100,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(&p16, spec16).unwrap();
+        for i in 0..4410 {
+            w.write_sample((0.5 * (i as f32 * 0.1).sin() * i16::MAX as f32) as i16)
+                .unwrap();
+        }
+        w.finalize().unwrap();
+        let (rate, pcm) = read_wav_mono(p16.to_str().unwrap()).expect("reads i16");
+        assert_eq!(rate, 44100);
+        assert_eq!(pcm.len(), 4410);
+        assert!(pcm.iter().any(|s| s.abs() > 0.4));
+        let pf = dir.join("zearo_testf.wav");
+        let specf = hound::WavSpec {
+            channels: 2,
+            sample_rate: 48000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut w = hound::WavWriter::create(&pf, specf).unwrap();
+        for i in 0..4800 {
+            let s = (i as f32 * 0.05).sin() * 0.25;
+            w.write_sample(s).unwrap();
+            w.write_sample(-s).unwrap();
+        }
+        w.finalize().unwrap();
+        let (rate, pcm) = read_wav_mono(pf.to_str().unwrap()).expect("reads float stereo");
+        assert_eq!(rate, 48000);
+        assert_eq!(pcm.len(), 4800, "mixed to mono");
+        let _ = std::fs::remove_file(p16);
+        let _ = std::fs::remove_file(pf);
+        assert!(read_wav_mono("definitely-not-a-file-xyz.wav").is_err());
+    }
+
+    #[test]
+    fn import_and_replace_buffer() {
+        let mut pool = AssetPool::generate();
+        let n0 = pool.len();
+        let id = pool.import("my-take", 44100, vec![0.1; 4410]);
+        assert_eq!(id, AssetId(n0 as u32));
+        assert_eq!(pool.find_by_name("my-take"), Some(id));
+        assert!(
+            !pool.replace_buffer(pool.find_by_name("kick").unwrap(), vec![0.0; 8]),
+            "generated assets are immutable"
+        );
+        assert!(pool.replace_buffer(id, vec![0.2; 100]));
+        assert_eq!(pool.get(id).unwrap().pcm.len(), 100);
     }
 
     #[test]

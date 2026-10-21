@@ -11,7 +11,7 @@
 
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc,
+    mpsc, Arc,
 };
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -23,6 +23,7 @@ use crate::pattern::{LiveViews, Sequencer};
 #[derive(Debug)]
 pub enum AudioError {
     NoOutputs,
+    NoInputs,
     Device(String),
     Config(String),
     Stream(String),
@@ -32,6 +33,7 @@ impl std::fmt::Display for AudioError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoOutputs => write!(f, "no audio output devices found"),
+            Self::NoInputs => write!(f, "no audio input devices found"),
             Self::Device(e) => write!(f, "audio device error: {e}"),
             Self::Config(e) => write!(f, "audio config error: {e}"),
             Self::Stream(e) => write!(f, "audio stream error: {e}"),
@@ -266,6 +268,100 @@ pub fn start_multi(
     })
 }
 
+/// Prefer the iD22 input (main pair 1/2 first); otherwise the system default.
+/// Pure: unit-tested without hardware.
+pub fn rank_input(names: &[String]) -> Option<usize> {
+    let lower: Vec<String> = names.iter().map(|n| n.to_lowercase()).collect();
+    lower
+        .iter()
+        .position(|n| n.contains("id22") && n.contains("1/2"))
+        .or_else(|| lower.iter().position(|n| n.contains("id22")))
+        .or(if names.is_empty() { None } else { Some(0) })
+}
+
+#[derive(Debug, Clone)]
+pub struct InputInfo {
+    pub name: String,
+    pub sample_rate: u32,
+    pub channels: u16,
+}
+
+/// Open the preferred input and forward mono f32 chunks to the UI thread.
+/// Capture plumbing only — accumulation, analysis and preparation all run
+/// off-thread, never on an audio callback.
+pub struct InputCapture {
+    _stream: cpal::Stream,
+    pub info: InputInfo,
+    pub rx: mpsc::Receiver<Vec<f32>>,
+}
+
+pub fn start_input_capture() -> Result<InputCapture, AudioError> {
+    let host = cpal::default_host();
+    let devices = host
+        .input_devices()
+        .map_err(|e| AudioError::Device(e.to_string()))?;
+    let mut listed: Vec<(cpal::Device, String)> = Vec::new();
+    for device in devices {
+        let name = device
+            .description()
+            .map(|d| d.name().to_owned())
+            .unwrap_or_else(|_| "<unnamed>".to_string());
+        listed.push((device, name));
+    }
+    if listed.is_empty() {
+        return Err(AudioError::NoInputs);
+    }
+    let names: Vec<String> = listed.iter().map(|(_, n)| n.clone()).collect();
+    let index = rank_input(&names).ok_or(AudioError::NoInputs)?;
+    let (device, name) = listed.drain(index..=index).next().unwrap();
+    // Float path only: every WASAPI USB input we care about offers it,
+    // and anything else fails loudly instead of mis-converting.
+    let supported: Vec<cpal::SupportedStreamConfigRange> = device
+        .supported_input_configs()
+        .map_err(|e| AudioError::Config(e.to_string()))?
+        .collect();
+    let best = supported
+        .iter()
+        .filter(|c| c.sample_format() == cpal::SampleFormat::F32)
+        .max_by_key(|c| c.max_sample_rate());
+    let range = best.ok_or_else(|| AudioError::Config("no f32 input config".to_string()))?;
+    let config: cpal::StreamConfig = range.with_max_sample_rate().into();
+    let sample_rate = config.sample_rate;
+    let channels = config.channels;
+    let (tx, rx) = mpsc::channel();
+    let stream = device
+        .build_input_stream(
+            config,
+            move |data: &[f32], _| {
+                let frames = data.len() / channels.max(1) as usize;
+                let mut mono = Vec::with_capacity(frames);
+                for i in 0..frames {
+                    let mut acc = 0.0f32;
+                    for c in 0..channels as usize {
+                        acc += data[i * channels as usize + c];
+                    }
+                    mono.push(acc / channels.max(1) as f32);
+                }
+                let _ = tx.send(mono);
+            },
+            |err| eprintln!("zearo input error: {err}"),
+            None,
+        )
+        .map_err(|e| AudioError::Stream(e.to_string()))?;
+    stream
+        .play()
+        .map_err(|e| AudioError::Stream(e.to_string()))?;
+    Ok(InputCapture {
+        _stream: stream,
+        info: InputInfo {
+            name,
+            sample_rate,
+            channels,
+        },
+        rx,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,6 +384,16 @@ mod tests {
             "Speakers".to_string(),
         ];
         assert_eq!(rank_output(&names), Some(1));
+    }
+
+    #[test]
+    fn prefers_id22_input() {
+        let names = vec![
+            "Input 5/6 (Audient iD22)".to_string(),
+            "Input 1/2 (Audient iD22)".to_string(),
+        ];
+        assert_eq!(rank_input(&names), Some(1));
+        assert_eq!(rank_input(&[]), None);
     }
 
     #[test]

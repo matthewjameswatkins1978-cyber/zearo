@@ -15,7 +15,7 @@ use rtrb::{Consumer, Producer};
 
 use crate::audio::{self, LiveTrack, RunningAudio};
 use crate::engine::{drain_retired, prepare, Engine, Msg, Shared};
-use crate::instrument::{percussion_kit, pitched_pluck, snare9, Instrument, TargetId};
+use crate::instrument::{percussion_kit, pitched_pluck, snare9, Instrument, Selector, TargetId};
 use crate::layout::{Layout, PadAction};
 use crate::midi::{self, MidiBridge};
 use crate::pattern::{LiveViews, Pattern, Sequencer};
@@ -177,6 +177,23 @@ fn target_color(id: u32, glow: f32) -> egui::Color32 {
     egui::Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
 }
 
+/// An in-progress input-capture take. The stream delivers chunks on its
+/// own thread; the UI accumulates them here, off the audio thread.
+struct RecState {
+    cap: crate::audio::InputCapture,
+    acc: Vec<f32>,
+    max_frames: usize,
+}
+
+/// A finished take: original preserved, playback prepared separately.
+#[derive(Clone)]
+struct LastTake {
+    name: String,
+    original: Vec<f32>,
+    rate: u32,
+    asset: crate::sample::AssetId,
+}
+
 pub struct ZearoApp {
     pool: AssetPool,
     song: Song,
@@ -199,6 +216,15 @@ pub struct ZearoApp {
     flash: HashMap<TargetId, (f64, u8)>,
     midi: Option<MidiBridge>,
     midi_status: String,
+    imports: Vec<String>,
+    import_pick: String,
+    recording: Option<RecState>,
+    last_take: Option<LastTake>,
+    assigned: Option<(TargetId, crate::sample::AssetId)>,
+    trim_start_ms: f32,
+    trim_end_ms: f32,
+    take_count: u32,
+    sample_status: String,
 }
 
 impl Default for ZearoApp {
@@ -234,6 +260,15 @@ impl ZearoApp {
             flash: HashMap::new(),
             midi: None,
             midi_status: "MIDI: not connected".to_string(),
+            imports: Vec::new(),
+            import_pick: String::new(),
+            recording: None,
+            last_take: None,
+            assigned: None,
+            trim_start_ms: 0.0,
+            trim_end_ms: 0.0,
+            take_count: 0,
+            sample_status: String::new(),
         };
         match audio::start_multi(live, views) {
             Ok(running) => {
@@ -252,6 +287,8 @@ impl ZearoApp {
             }
         }
         app.midi_connect();
+        let _ = std::fs::create_dir_all("imports");
+        app.refresh_imports();
         app
     }
 
@@ -311,6 +348,232 @@ impl ZearoApp {
         }
     }
 
+    fn refresh_imports(&mut self) {
+        let mut names = Vec::new();
+        if let Ok(entries) = std::fs::read_dir("imports") {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let is_wav = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.eq_ignore_ascii_case("wav"))
+                    .unwrap_or(false);
+                if is_wav {
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        names.push(name.to_string());
+                    }
+                }
+            }
+        }
+        names.sort();
+        self.imports = names;
+        if self.import_pick.is_empty() {
+            if let Some(first) = self.imports.first().cloned() {
+                self.import_pick = first;
+            }
+        }
+    }
+
+    fn unique_take_name(&self, base: &str) -> String {
+        let mut name = base.to_string();
+        let mut n = 2;
+        while self.pool.find_by_name(&name).is_some() {
+            name = format!("{base}-{n}");
+            n += 1;
+        }
+        name
+    }
+
+    /// Prepare a take, import it, remember the original. Assignment to a
+    /// target happens separately so one recording can feed several slots.
+    fn take_audio(&mut self, name: String, rate: u32, pcm: Vec<f32>, to_new: bool) {
+        let prep = crate::sample::prepare_take(rate, &pcm);
+        if prep.pcm.is_empty() {
+            self.sample_status = format!("{name}: silence, nothing assigned");
+            return;
+        }
+        let name = self.unique_take_name(&name);
+        let id = self
+            .pool
+            .import(&name, crate::sample::SAMPLE_RATE, prep.pcm);
+        self.song.samples.push(crate::song::StoredSample {
+            name: name.clone(),
+            sample_rate: rate,
+            pcm,
+        });
+        let ms = self
+            .song
+            .samples
+            .last()
+            .map(|s| s.pcm.len() as f32 / rate as f32 * 1000.0)
+            .unwrap_or(0.0);
+        self.last_take = Some(LastTake {
+            name: name.clone(),
+            original: Vec::new(),
+            rate,
+            asset: id,
+        });
+        self.trim_start_ms = 0.0;
+        self.trim_end_ms = ms;
+        self.assigned = None;
+        // Move the original into the take without another big copy.
+        if let Some(take) = self.last_take.as_mut() {
+            take.original = self
+                .song
+                .samples
+                .last()
+                .map(|s| s.pcm.clone())
+                .unwrap_or_default();
+        }
+        if to_new {
+            self.assign_take(true);
+        } else {
+            self.sample_status = format!("{name} ready — assign to a target");
+        }
+    }
+
+    fn assign_take(&mut self, to_new: bool) {
+        let take = match self.last_take.clone() {
+            Some(t) => t,
+            None => {
+                self.sample_status = "nothing to assign — record or load first".into();
+                return;
+            }
+        };
+        let active = self.active;
+        if to_new {
+            let next = self
+                .song
+                .tracks
+                .get(active)
+                .and_then(|t| t.instrument.as_ref())
+                .map(|inst| inst.targets.iter().map(|t| t.id.0).max().unwrap_or(0) + 1);
+            let next = match next {
+                Some(n) => n,
+                None => {
+                    self.sample_status = "no instrument on this track".into();
+                    return;
+                }
+            };
+            let target = TargetId(next);
+            if let Some(track) = self.song.tracks.get_mut(active) {
+                let inst = track
+                    .instrument
+                    .get_or_insert(crate::instrument::Instrument {
+                        name: "Samples".to_string(),
+                        targets: vec![],
+                        asset_names: vec![],
+                    });
+                inst.targets.push(crate::instrument::Target {
+                    id: target,
+                    name: take.name.clone(),
+                    selector: Selector::OneShot { source: take.asset },
+                    level: 0.9,
+                    decay: 1.0,
+                    choke_group: None,
+                    pitch_tracking: false,
+                    root_note: 60,
+                });
+            }
+            self.selected = Some(target);
+            self.assigned = Some((target, take.asset));
+            self.rebuild(active);
+            self.sample_status = format!("{} on a new pad", take.name);
+        } else {
+            let sel = self.selected;
+            let mut done = None;
+            if let Some(inst) = self
+                .song
+                .tracks
+                .get_mut(active)
+                .and_then(|t| t.instrument.as_mut())
+            {
+                if let Some(sel) = sel {
+                    if let Some(old) = inst.audition_sources(sel).first().copied() {
+                        if inst.replace_source(sel, old, take.asset) {
+                            done = Some((sel, take.asset));
+                        }
+                    }
+                }
+            }
+            if let Some((t, id)) = done {
+                self.assigned = Some((t, id));
+                self.rebuild(active);
+                self.sample_status = format!("{} on {}", take.name, t.0);
+            } else {
+                self.sample_status = "select a target with a take first".into();
+            }
+        }
+    }
+
+    fn apply_trim(&mut self) {
+        let (take, _target, asset) = match (&self.last_take, &self.assigned) {
+            (Some(t), Some((tgt, id))) => (t.clone(), *tgt, *id),
+            _ => {
+                self.sample_status = "assign a take first".into();
+                return;
+            }
+        };
+        let sr = take.rate as f32;
+        let a = (self.trim_start_ms.max(0.0) / 1000.0 * sr) as usize;
+        let b = (self.trim_end_ms.max(0.0) / 1000.0 * sr) as usize;
+        let (a, b) = (a.min(take.original.len()), b.min(take.original.len()));
+        if b <= a + 100 {
+            self.sample_status = "trim range too small".into();
+            return;
+        }
+        let prep = crate::sample::prepare_take(take.rate, &take.original[a..b]);
+        if prep.pcm.is_empty() {
+            self.sample_status = "trimmed to silence".into();
+            return;
+        }
+        if self.pool.replace_buffer(asset, prep.pcm) {
+            self.rebuild(self.active);
+            self.sample_status = format!(
+                "trimmed {} to {:.0}–{:.0} ms",
+                take.name, self.trim_start_ms, self.trim_end_ms
+            );
+        }
+    }
+
+    fn start_take(&mut self) {
+        if self.recording.is_some() {
+            return;
+        }
+        match crate::audio::start_input_capture() {
+            Ok(cap) => {
+                let name = cap.info.name.clone();
+                let max_frames = cap.info.sample_rate as usize * 10;
+                self.recording = Some(RecState {
+                    cap,
+                    acc: Vec::new(),
+                    max_frames,
+                });
+                self.sample_status = format!("recording from {name} …");
+            }
+            Err(e) => self.sample_status = format!("input failed: {e}"),
+        }
+    }
+
+    fn stop_take(&mut self, auto: bool) {
+        let Some(rec) = self.recording.take() else {
+            return;
+        };
+        let rate = rec.cap.info.sample_rate;
+        drop(rec.cap);
+        self.take_count += 1;
+        let n = self.take_count;
+        if rec.acc.len() < 100 {
+            self.sample_status = if auto {
+                "take too short".to_string()
+            } else {
+                "take discarded (too short)".to_string()
+            };
+            return;
+        }
+        self.take_audio(format!("take-{n}"), rate, rec.acc, false);
+    }
+
     fn save(&mut self) {
         let song = self.snapshot_song();
         match song::save_song(&song) {
@@ -344,6 +607,10 @@ impl ZearoApp {
             );
             return;
         }
+        // Fresh pool every load: generate + restore in doc order, so the
+        // restored ids match the takes that reference them.
+        self.pool = AssetPool::generate();
+        song::restore_samples(&mut self.pool, &song);
         self.song = song;
         for i in 0..self.handles.len() {
             self.rebuild(i);
@@ -413,6 +680,21 @@ impl eframe::App for ZearoApp {
         let now = ui.input(|i| i.time);
         for h in self.handles.iter_mut() {
             h.retired += drain_retired(&mut h.retire_rx) as u64;
+        }
+        if self.recording.is_some() {
+            let mut finished = false;
+            if let Some(rec) = self.recording.as_mut() {
+                while let Ok(chunk) = rec.cap.rx.try_recv() {
+                    rec.acc.extend_from_slice(&chunk);
+                    if rec.acc.len() >= rec.max_frames {
+                        finished = true;
+                        break;
+                    }
+                }
+            }
+            if finished {
+                self.stop_take(true);
+            }
         }
         // MIDI input: parsed + mapped on the UI thread so the single
         // audio-queue producer stays single. Plays and records like pads.
@@ -578,6 +860,7 @@ impl eframe::App for ZearoApp {
             ui.vertical(|ui| {
                 ui.set_min_width(420.0);
                 self.ui_target_panel(ui);
+                self.ui_sampling(ui);
             });
         });
 
@@ -977,6 +1260,85 @@ impl ZearoApp {
             snap.events.len(),
             snap.length_ticks
         ));
+    }
+
+    fn ui_sampling(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.heading("Sampling");
+        ui.label("Drop .wav files into the imports/ folder.");
+        ui.horizontal(|ui| {
+            if ui.button("Refresh imports").clicked() {
+                self.refresh_imports();
+            }
+            egui::ComboBox::from_label("WAV")
+                .selected_text(&self.import_pick)
+                .show_ui(ui, |ui| {
+                    for name in &self.imports {
+                        ui.selectable_value(&mut self.import_pick, name.clone(), name);
+                    }
+                });
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Load to selected").clicked() {
+                let pick = self.import_pick.clone();
+                self.load_wav(&pick, false);
+            }
+            if ui.button("Load as new target").clicked() {
+                let pick = self.import_pick.clone();
+                self.load_wav(&pick, true);
+            }
+        });
+        if self.recording.is_some() {
+            if ui.button("\u{25a0} Stop take (10 s max)").clicked() {
+                self.stop_take(false);
+            }
+        } else if ui.button("\u{25cf} Take from input").clicked() {
+            self.start_take();
+        }
+        if self.last_take.is_some() {
+            ui.horizontal(|ui| {
+                let end_max = self.trim_end_ms.max(1.0);
+                ui.add(egui::Slider::new(&mut self.trim_start_ms, 0.0..=end_max).text("start ms"));
+                let start_min = self.trim_start_ms.min(self.trim_end_ms).max(0.0);
+                let total = self
+                    .last_take
+                    .as_ref()
+                    .map(|t| t.original.len() as f32 / t.rate as f32 * 1000.0)
+                    .unwrap_or(0.0);
+                ui.add(
+                    egui::Slider::new(&mut self.trim_end_ms, start_min..=total.max(1.0))
+                        .text("end ms"),
+                );
+                if ui.button("Apply trim").clicked() {
+                    self.apply_trim();
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui.button("To selected target").clicked() {
+                    self.assign_take(false);
+                }
+                if ui.button("As new target").clicked() {
+                    self.assign_take(true);
+                }
+            });
+        }
+        ui.label(&self.sample_status);
+    }
+
+    fn load_wav(&mut self, file: &str, to_new: bool) {
+        if file.is_empty() {
+            self.sample_status = "no WAV selected — Refresh imports".to_string();
+            return;
+        }
+        let path = format!("imports/{file}");
+        let stem = file
+            .trim_end_matches(".wav")
+            .trim_end_matches(".WAV")
+            .to_string();
+        match crate::sample::read_wav_mono(&path) {
+            Ok((rate, pcm)) => self.take_audio(stem, rate, pcm, to_new),
+            Err(e) => self.sample_status = format!("WAV failed: {e}"),
+        }
     }
 
     fn load_factory(&mut self, t: usize, factory: Factory) {

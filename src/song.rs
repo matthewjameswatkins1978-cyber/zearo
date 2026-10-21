@@ -15,7 +15,7 @@ use crate::pattern::Pattern;
 pub const DOC_FORMAT: &str = "zearo-doc";
 /// Current document version. Bump on any breaking model change and add a
 /// migration; never silently accept an unknown version.
-pub const DOC_VERSION: u32 = 0;
+pub const DOC_VERSION: u32 = 1;
 /// Fixed song size for this milestone (arranger depth comes later).
 pub const TRACKS: usize = 8;
 
@@ -31,6 +31,19 @@ pub struct Song {
     pub name: String,
     pub bpm: f64,
     pub tracks: Vec<Track>,
+    /// Original user recordings (WAV imports, input takes). The pool only
+    /// caches prepared playback buffers; these originals are the source
+    /// of truth for re-trimming and reloads.
+    #[serde(default)]
+    pub samples: Vec<StoredSample>,
+}
+
+/// One stored original recording.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredSample {
+    pub name: String,
+    pub sample_rate: u32,
+    pub pcm: Vec<f32>,
 }
 
 impl Song {
@@ -45,6 +58,7 @@ impl Song {
                     pattern: None,
                 })
                 .collect(),
+            samples: Vec::new(),
         }
     }
 
@@ -61,7 +75,33 @@ impl Song {
 struct Envelope {
     format: String,
     version: u32,
-    song: Song,
+    song: serde_json::Value,
+}
+
+/// Version-0 song shape (no stored samples). Migrated on load.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SongV0 {
+    name: String,
+    bpm: f64,
+    tracks: Vec<Track>,
+}
+
+/// Restore a song's originals into a fresh pool. Import order is the doc
+/// order, so restored ids match the takes that reference them.
+/// Call on a pool built by `AssetPool::generate` (or rebuilt for it).
+pub fn restore_samples(
+    pool: &mut crate::sample::AssetPool,
+    song: &Song,
+) -> Vec<crate::sample::AssetId> {
+    let mut ids = Vec::new();
+    for s in &song.samples {
+        if let Some(existing) = pool.find_by_name(&s.name) {
+            ids.push(existing);
+        } else {
+            ids.push(pool.import(&s.name, s.sample_rate, s.pcm.clone()));
+        }
+    }
+    ids
 }
 
 #[derive(Debug)]
@@ -88,22 +128,35 @@ pub fn save_song(song: &Song) -> Result<String, serde_json::Error> {
     let envelope = Envelope {
         format: DOC_FORMAT.to_string(),
         version: DOC_VERSION,
-        song: song.clone(),
+        song: serde_json::to_value(song.clone())?,
     };
     serde_json::to_string_pretty(&envelope)
 }
 
-/// Load and validate a song document.
+/// Load and validate a song document, migrating older versions forward.
+/// Unknown future versions are rejected, never guessed.
 pub fn load_song(text: &str) -> Result<Song, LoadError> {
     let envelope: Envelope =
         serde_json::from_str(text).map_err(|e| LoadError::Json(e.to_string()))?;
     if envelope.format != DOC_FORMAT {
         return Err(LoadError::Format(envelope.format));
     }
-    if envelope.version != DOC_VERSION {
-        return Err(LoadError::Version(envelope.version));
+    match envelope.version {
+        DOC_VERSION => {
+            serde_json::from_value(envelope.song).map_err(|e| LoadError::Json(e.to_string()))
+        }
+        0 => {
+            let old: SongV0 = serde_json::from_value(envelope.song)
+                .map_err(|e| LoadError::Json(e.to_string()))?;
+            Ok(Song {
+                name: old.name,
+                bpm: old.bpm,
+                tracks: old.tracks,
+                samples: Vec::new(),
+            })
+        }
+        v => Err(LoadError::Version(v)),
     }
-    Ok(envelope.song)
 }
 
 #[cfg(test)]
@@ -182,6 +235,80 @@ mod tests {
             r#"{{"format":"{DOC_FORMAT}","version":99,"song":{{"name":"","bpm":120.0,"tracks":[]}}}}"#
         );
         assert!(matches!(load_song(&future), Err(LoadError::Version(99))));
+    }
+
+    #[test]
+    fn v0_documents_migrate_forward() {
+        let v0 = format!(
+            r#"{{"format":"{DOC_FORMAT}","version":0,"song":{{"name":"old","bpm":100.0,"tracks":[]}}}}"#
+        );
+        let back = load_song(&v0).expect("v0 migrates");
+        assert_eq!(back.name, "old");
+        assert!(back.samples.is_empty());
+    }
+
+    #[test]
+    fn imported_take_round_trips_with_samples() {
+        use crate::engine::Engine;
+        use crate::sample::{prepare_take, SAMPLE_RATE};
+        // Simulate a user take: loud mid section with quiet edges.
+        let mut raw = vec![0.0f32; SAMPLE_RATE as usize];
+        for (i, s) in raw
+            .iter_mut()
+            .enumerate()
+            .take(SAMPLE_RATE as usize / 2)
+            .skip(1000)
+        {
+            let t = i as f32 / SAMPLE_RATE as f32;
+            *s = (2.0 * std::f32::consts::PI * 220.0 * t).sin() * 0.4;
+        }
+        let prep = prepare_take(SAMPLE_RATE, &raw);
+        assert!(prep.peak > 0.5);
+        // Fresh pool + instrument take referencing the import.
+        let mut pool = AssetPool::generate();
+        let id = pool.import("user-take", SAMPLE_RATE, prep.pcm.clone());
+        let mut song = demo_song();
+        song.tracks[0].instrument.as_mut().unwrap().targets[0] = crate::instrument::Target {
+            id: crate::instrument::TargetId(40),
+            name: "User Take".to_string(),
+            selector: crate::instrument::Selector::OneShot { source: id },
+            level: 0.9,
+            decay: 1.0,
+            choke_group: None,
+            pitch_tracking: false,
+            root_note: 60,
+        };
+        song.tracks[0].pattern.as_mut().unwrap().events.clear();
+        song.tracks[0]
+            .pattern
+            .as_mut()
+            .unwrap()
+            .add(crate::instrument::TargetId(40), 60, 100, 0);
+        song.samples.push(StoredSample {
+            name: "user-take".to_string(),
+            sample_rate: SAMPLE_RATE,
+            pcm: raw,
+        });
+        let text = save_song(&song).expect("saves");
+        // Fresh session: regenerate, restore, load, play.
+        let mut pool2 = AssetPool::generate();
+        let back = load_song(&text).expect("loads v1");
+        assert_eq!(back.samples.len(), 1);
+        let ids = restore_samples(&mut pool2, &back);
+        assert_eq!(ids, vec![id], "stable ids across restore");
+        let inst = back.tracks[0].instrument.as_ref().unwrap();
+        inst.validate().expect("valid");
+        let prepared = Arc::new(prepare(inst, &pool2, 1).expect("prepares with import"));
+        let (mut engine, _rx) = Engine::new(prepared, 44100.0);
+        assert!(engine.trigger(crate::instrument::TargetId(40), 60, 100));
+        let mut l = vec![0.0; 5000];
+        let mut r = vec![0.0; 5000];
+        engine.render_block(&mut l, &mut r);
+        assert!(l.iter().any(|s| s.abs() > 0.05), "imported take sounds");
+        // Idempotent restore: loading twice does not duplicate.
+        let ids2 = restore_samples(&mut pool2, &back);
+        assert_eq!(ids, ids2);
+        assert_eq!(pool2.find_by_name("user-take"), Some(id));
     }
 
     #[test]

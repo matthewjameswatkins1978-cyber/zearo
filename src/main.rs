@@ -4,6 +4,8 @@
 //! - `zearo --probe` → device enumeration only, no stream opened
 //! - `zearo --demo [bars]` → headless loop playback on the preferred output
 //!   with a stats report (automated audio-path proof, no display needed)
+//! - `zearo --input-test [secs]` → capture from the preferred input and
+//!   report what arrived (proves the recording path on real hardware)
 
 use std::sync::Arc;
 
@@ -13,6 +15,7 @@ fn main() {
     match std::env::args().nth(1).as_deref() {
         Some("--probe") => probe(),
         Some("--demo") => demo(),
+        Some("--input-test") => input_test(),
         Some("--help" | "-h") => help(),
         _ => zearo::app::run(),
     }
@@ -23,6 +26,7 @@ fn help() {
     println!("  zearo            desktop app (grid + layouts + transport)");
     println!("  zearo --probe    list audio/MIDI devices, no stream");
     println!("  zearo --demo [N] play the demo loop N bars headless (default 4)");
+    println!("  zearo --input-test [S] capture S seconds of input (default 2)");
 }
 
 fn probe() {
@@ -92,6 +96,46 @@ fn demo() {
         }
         Err(e) => {
             eprintln!("zearo demo: audio failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn input_test() {
+    let secs: u64 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2)
+        .clamp(1, 10);
+    match zearo::audio::start_input_capture() {
+        Ok(cap) => {
+            println!(
+                "zearo input: {} @ {} Hz, {} ch — capturing {secs}s",
+                cap.info.name, cap.info.sample_rate, cap.info.channels
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+            let mut frames = 0usize;
+            let mut peak = 0.0f32;
+            let mut sum = 0.0f64;
+            while std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                while let Ok(chunk) = cap.rx.try_recv() {
+                    frames += chunk.len();
+                    for s in &chunk {
+                        peak = peak.max(s.abs());
+                        sum += f64::from(*s) * f64::from(*s);
+                    }
+                }
+            }
+            let rms = if frames > 0 {
+                (sum / frames as f64).sqrt()
+            } else {
+                0.0
+            };
+            println!("zearo input: {frames} frames, peak {peak:.3}, rms {rms:.4}");
+        }
+        Err(e) => {
+            eprintln!("zearo input failed: {e}");
             std::process::exit(1);
         }
     }

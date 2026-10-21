@@ -10,6 +10,7 @@ pub mod audio;
 pub mod engine;
 pub mod instrument;
 pub mod layout;
+pub mod midi;
 pub mod pattern;
 pub mod sample;
 pub mod song;

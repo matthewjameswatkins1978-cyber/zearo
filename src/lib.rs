@@ -5,10 +5,13 @@
 //! and audio/MIDI device enumeration (`cpal`, `midir`).
 
 use cpal::traits::{DeviceTrait, HostTrait};
+pub mod audio;
 pub mod engine;
 pub mod instrument;
+pub mod layout;
 pub mod pattern;
 pub mod sample;
+pub mod song;
 
 use fundsp::prelude::*;
 

@@ -280,6 +280,9 @@ pub struct Engine {
     pub steals: u64,
     age: u64,
     sample_rate: f32,
+    /// Asset rate (44.1 kHz) over device rate: keeps pitch right on 48 kHz
+    /// devices without resampling the immutable assets.
+    rate_factor: f32,
 }
 
 impl Engine {
@@ -297,6 +300,7 @@ impl Engine {
             steals: 0,
             age: 0,
             sample_rate,
+            rate_factor: crate::sample::SAMPLE_RATE as f32 / sample_rate,
         };
         engine.rebuild_rr();
         (engine, retire_rx)
@@ -437,6 +441,13 @@ impl Engine {
         true
     }
 
+    /// Retune the engine to the real device rate. Call after opening the
+    /// stream, before transport starts.
+    pub fn set_device_rate(&mut self, sample_rate: f32) {
+        self.sample_rate = sample_rate;
+        self.rate_factor = crate::sample::SAMPLE_RATE as f32 / sample_rate;
+    }
+
     /// Start one voice on a concrete buffer.
     fn start_voice(
         &mut self,
@@ -457,7 +468,7 @@ impl Engine {
         voice.active = true;
         voice.buf = Some(buf);
         voice.pos = 0.0;
-        voice.rate = rate;
+        voice.rate = rate * self.rate_factor;
         voice.gain = gain;
         voice.decay_k = decay_k;
         voice.elapsed = 0.0;
@@ -744,5 +755,21 @@ mod tests {
             source: AssetId(424242),
         };
         assert!(prepare(&inst, &pool, 1).is_err());
+    }
+
+    #[test]
+    fn device_rate_retunes_without_resampling_assets() {
+        let pool = AssetPool::generate();
+        let inst = percussion_kit(&pool);
+        let prepared = Arc::new(prepare(&inst, &pool, 1).expect("prepares"));
+        let (mut engine, _rx) = Engine::new(prepared, 44100.0);
+        engine.set_device_rate(48000.0);
+        assert!(engine.trigger(TargetId(5), 60, 100));
+        let voice = engine.voices.iter().find(|v| v.active).expect("voice");
+        assert!(
+            (voice.rate - 44100.0 / 48000.0).abs() < 1e-6,
+            "rate {}",
+            voice.rate
+        );
     }
 }

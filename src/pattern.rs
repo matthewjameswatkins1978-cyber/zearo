@@ -5,6 +5,12 @@
 //! in stored data); the transport carries the fractional position between
 //! audio frames. Timing derives from the audio clock, never the frame rate.
 
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
+
+use arc_swap::ArcSwap;
 use rtrb::Consumer;
 use serde::{Deserialize, Serialize};
 
@@ -81,7 +87,9 @@ impl Pattern {
             if e.target != target {
                 return true;
             }
-            let dist = (e.tick as i64 - center as i64).rem_euclid(len as i64).unsigned_abs();
+            let dist = (e.tick as i64 - center as i64)
+                .rem_euclid(len as i64)
+                .unsigned_abs();
             let wrapped = len - dist;
             let nearest = dist.min(wrapped);
             nearest > half_window
@@ -146,6 +154,23 @@ impl Transport {
 
     pub fn stop(&mut self) {
         self.playing = false;
+    }
+}
+
+/// UI-side read handle for the live pattern. The audio thread publishes a
+/// clone only when [`Pattern::rev`] changes (user edits), never per block;
+/// the UI renders from this snapshot and never touches sequencer state.
+pub struct LiveViews {
+    pub pattern: ArcSwap<Pattern>,
+    pub published_rev: AtomicU64,
+}
+
+impl LiveViews {
+    pub fn new(pattern: &Pattern) -> Self {
+        Self {
+            pattern: ArcSwap::from(Arc::new(pattern.clone())),
+            published_rev: AtomicU64::new(pattern.rev),
+        }
     }
 }
 
@@ -219,6 +244,16 @@ impl Sequencer {
 
     pub fn set_bpm(&mut self, bpm: f64) {
         self.transport.bpm = bpm.clamp(30.0, 300.0);
+    }
+
+    /// Publish a display snapshot when the pattern changed. Called from the
+    /// audio thread after each block; cheap when nothing changed.
+    pub fn publish(&self, views: &LiveViews) {
+        let rev = self.pattern.rev;
+        if views.published_rev.load(Ordering::Relaxed) != rev {
+            views.pattern.store(Arc::new(self.pattern.clone()));
+            views.published_rev.store(rev, Ordering::Relaxed);
+        }
     }
 
     /// One audio block: schedule pattern events by the audio clock, apply UI

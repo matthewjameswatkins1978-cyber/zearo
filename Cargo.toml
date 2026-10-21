@@ -21,6 +21,9 @@ fundsp = "0.23"
 eframe = "0.37"
 egui = "0.37"
 rtrb = "0.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+arc-swap = "1.9.3"
 
 [dev-dependencies]
 criterion = "0.8"

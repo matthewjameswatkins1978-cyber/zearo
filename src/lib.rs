@@ -5,6 +5,9 @@
 //! and audio/MIDI device enumeration (`cpal`, `midir`).
 
 use cpal::traits::{DeviceTrait, HostTrait};
+pub mod instrument;
+pub mod sample;
+
 use fundsp::prelude::*;
 
 /// Render `seconds` of a 440 Hz sine tone at `sample_rate` Hz.

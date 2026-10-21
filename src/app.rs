@@ -55,6 +55,8 @@ pub fn demo_project() -> (Song, AssetPool) {
     for s in [2, 6, 10, 14] {
         groove.add(TargetId(8), 60, 60, step(s));
     }
+    groove.add(TargetId(11), 60, 80, step(6));
+    groove.add(TargetId(10), 60, 90, step(10));
     song.tracks[0].name = "Kit".to_string();
     song.tracks[0].instrument = Some(percussion_kit(&pool));
     song.tracks[0].pattern = Some(groove);
@@ -79,9 +81,10 @@ pub fn demo_project() -> (Song, AssetPool) {
         (8, 60),
         (10, 57),
         (12, 55),
-        (14, 53),
+        (14, 36),
     ] {
-        line.add(TargetId(0), n, 88, step(s));
+        let vel = if n < 40 { 90 } else { 88 };
+        line.add(TargetId(0), n, vel, step(s));
     }
     song.tracks[2].name = "Pluck".to_string();
     song.tracks[2].instrument = Some(pitched_pluck(&pool));

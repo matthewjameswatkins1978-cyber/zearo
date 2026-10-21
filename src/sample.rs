@@ -47,6 +47,19 @@ pub enum Recipe {
     Crash {
         variant: u32,
     },
+    Conga {
+        variant: u32,
+    },
+    Cowbell {
+        variant: u32,
+    },
+    Tambourine {
+        variant: u32,
+    },
+    Woodblock {
+        high: bool,
+        variant: u32,
+    },
     /// Pitched pluck recorded at `note` (MIDI), `band` 0 = soft/dark, 1 = hard/bright.
     Pluck {
         note: u8,
@@ -127,7 +140,24 @@ impl AssetPool {
         push("rim", Recipe::Rim { variant: 0 });
         push("shaker", Recipe::Shaker { variant: 0 });
         push("crash", Recipe::Crash { variant: 0 });
-        for note in [48u8, 53, 57, 60, 64] {
+        push("conga", Recipe::Conga { variant: 0 });
+        push("cowbell", Recipe::Cowbell { variant: 0 });
+        push("tambourine", Recipe::Tambourine { variant: 0 });
+        push(
+            "woodblock_hi",
+            Recipe::Woodblock {
+                high: true,
+                variant: 0,
+            },
+        );
+        push(
+            "woodblock_lo",
+            Recipe::Woodblock {
+                high: false,
+                variant: 0,
+            },
+        );
+        for note in [36u8, 41, 48, 53, 57, 60, 64] {
             for band in 0..2u8 {
                 push(
                     &format!("pluck_{}_{}", note, ["soft", "hard"][band as usize]),
@@ -184,7 +214,7 @@ impl Rng {
 
     /// Uniform in [0, 1).
     fn next_f32(&mut self) -> f32 {
-        ((self.next_u64() >> 33) as f32) / (u32::MAX as f32)
+        ((self.next_u64() >> 32) as f32) / (u32::MAX as f32)
     }
 
     /// Uniform in [-1, 1).
@@ -249,6 +279,10 @@ pub fn render_recipe(recipe: &Recipe) -> Vec<f32> {
         Recipe::Rim { variant } => 0x6000 + u64::from(*variant),
         Recipe::Shaker { variant } => 0x7000 + u64::from(*variant),
         Recipe::Crash { variant } => 0x8000 + u64::from(*variant),
+        Recipe::Conga { variant } => 0xA000 + u64::from(*variant),
+        Recipe::Cowbell { variant } => 0xB000 + u64::from(*variant),
+        Recipe::Tambourine { variant } => 0xC000 + u64::from(*variant),
+        Recipe::Woodblock { high, variant } => 0xD000 + u64::from(*variant) * 2 + u64::from(*high),
         Recipe::Pluck { note, band } => 0x9000 + u64::from(*note) * 4 + u64::from(*band),
     });
 
@@ -286,7 +320,7 @@ pub fn render_recipe(recipe: &Recipe) -> Vec<f32> {
                 let noise = rng.bipolar() * (-t * 28.0).exp() * 0.6 * brightness;
                 let body =
                     (2.0 * std::f32::consts::PI * body_freq * t).sin() * (-t * 22.0).exp() * 0.7;
-                *s = noise + body;
+                *s = (noise + body) * 1.6;
             }
             one_pole_highpass(&mut buf, 900.0);
             buf
@@ -298,7 +332,7 @@ pub fn render_recipe(recipe: &Recipe) -> Vec<f32> {
             let decay = if *open { 9.0 } else { 70.0 };
             for (i, s) in buf.iter_mut().enumerate() {
                 let t = i as f32 / sr;
-                *s = rng.bipolar() * (-t * decay).exp() * 0.5;
+                *s = rng.bipolar() * (-t * decay).exp() * 1.5;
             }
             one_pole_highpass(&mut buf, 7000.0);
             buf
@@ -309,11 +343,12 @@ pub fn render_recipe(recipe: &Recipe) -> Vec<f32> {
             let mut buf = vec![0.0f32; n];
             for (i, s) in buf.iter_mut().enumerate() {
                 let t = i as f32 / sr;
-                // Three clustered bursts + tail.
-                let burst = (-((t - 0.005) * 900.0).exp()
-                    + -((t - 0.02) * 700.0).exp()
-                    + (-((t - 0.045) * 260.0).exp()) * 0.7)
-                    .max(0.0);
+                // Three clustered bursts + tail. The minus must negate the
+                // exponent argument (decaying bursts), never the exp result
+                // (which would clamp everything to silence).
+                let burst = ((0.005 - t) * 900.0).exp()
+                    + ((0.02 - t) * 700.0).exp()
+                    + ((0.045 - t) * 260.0).exp() * 0.7;
                 *s = rng.bipolar() * burst.min(1.2) * 0.45;
             }
             one_pole_highpass(&mut buf, 1200.0);
@@ -354,9 +389,11 @@ pub fn render_recipe(recipe: &Recipe) -> Vec<f32> {
             let mut buf = vec![0.0f32; n];
             for (i, s) in buf.iter_mut().enumerate() {
                 let t = i as f32 / sr;
+                // Two hits + tail. Same precedence note as clap: negate
+                // the exponent argument, not the exp() result.
                 let env =
-                    (-((t - 0.01) * 160.0).exp() + (-((t - 0.07) * 120.0).exp()) * 0.7).max(0.0);
-                *s = rng.bipolar() * env.min(1.0) * 0.4;
+                    (((0.01 - t) * 160.0).exp() + ((0.07 - t) * 120.0).exp() * 0.7).clamp(0.0, 1.5);
+                *s = rng.bipolar() * env * 0.4;
             }
             one_pole_highpass(&mut buf, 6000.0);
             buf
@@ -367,7 +404,7 @@ pub fn render_recipe(recipe: &Recipe) -> Vec<f32> {
             let mut buf = vec![0.0f32; n];
             for (i, s) in buf.iter_mut().enumerate() {
                 let t = i as f32 / sr;
-                let mut v = rng.bipolar() * (-t * 4.5).exp() * 0.4;
+                let mut v = rng.bipolar() * (-t * 4.5).exp() * 1.2;
                 for partial in 1..5 {
                     v += (2.0 * std::f32::consts::PI * 620.0 * partial as f32 * 1.31 * t).sin()
                         * (-t * 5.0).exp()
@@ -377,6 +414,72 @@ pub fn render_recipe(recipe: &Recipe) -> Vec<f32> {
                 *s = v;
             }
             one_pole_highpass(&mut buf, 4500.0);
+            buf
+        }
+        Recipe::Conga { .. } => {
+            let dur = 0.4;
+            let n = (dur * f64::from(sr)) as usize;
+            let mut buf = vec![0.0f32; n];
+            let mut phase = 0.0f32;
+            for (i, s) in buf.iter_mut().enumerate() {
+                let t = i as f32 / sr;
+                let k = (t / (dur as f32)).min(1.0);
+                let freq = 215.0 + (130.0 - 215.0) * k;
+                phase += 2.0 * std::f32::consts::PI * freq / sr;
+                let tone = phase.sin() * (-t * 10.0).exp() * 0.8
+                    + (phase * 2.0).sin() * (-t * 14.0).exp() * 0.25;
+                let slap = if i < 200 {
+                    rng.bipolar() * (-t * 120.0).exp() * 0.5
+                } else {
+                    0.0
+                };
+                *s = tone + slap;
+            }
+            one_pole_lowpass(&mut buf, 5000.0);
+            buf
+        }
+        Recipe::Cowbell { .. } => {
+            let dur = 0.35;
+            let n = (dur * f64::from(sr)) as usize;
+            let mut buf = vec![0.0f32; n];
+            for (i, s) in buf.iter_mut().enumerate() {
+                let t = i as f32 / sr;
+                let a = (2.0 * std::f32::consts::PI * 540.0 * t).sin();
+                let b = (2.0 * std::f32::consts::PI * 810.0 * t).sin();
+                let v = (a + b) * 0.9;
+                let squared = v / (1.0 + v.abs());
+                *s = squared * (-t * 11.0).exp() * 1.3;
+            }
+            one_pole_highpass(&mut buf, 2500.0);
+            buf
+        }
+        Recipe::Tambourine { .. } => {
+            let dur = 0.3;
+            let n = (dur * f64::from(sr)) as usize;
+            let mut buf = vec![0.0f32; n];
+            for (i, s) in buf.iter_mut().enumerate() {
+                let t = i as f32 / sr;
+                let jingle = (2.0 * std::f32::consts::PI * 6300.0 * t).sin() * 0.3
+                    + (2.0 * std::f32::consts::PI * 8400.0 * t).sin() * 0.2
+                    + (2.0 * std::f32::consts::PI * 5200.0 * t).sin() * 0.25;
+                let trem = 0.6 + 0.4 * (2.0 * std::f32::consts::PI * 28.0 * t).sin();
+                *s = (rng.bipolar() * 0.6 + jingle * trem) * (-t * 13.0).exp() * 0.8;
+            }
+            one_pole_highpass(&mut buf, 6500.0);
+            buf
+        }
+        Recipe::Woodblock { high, .. } => {
+            let dur = 0.1;
+            let n = (dur * f64::from(sr)) as usize;
+            let mut buf = vec![0.0f32; n];
+            let freq = if *high { 880.0 } else { 660.0 };
+            for (i, s) in buf.iter_mut().enumerate() {
+                let t = i as f32 / sr;
+                *s = ((2.0 * std::f32::consts::PI * freq * t).sin()
+                    + (2.0 * std::f32::consts::PI * freq * 3.01 * t).sin() * 0.3)
+                    * (-t * 55.0).exp()
+                    * 0.75;
+            }
             buf
         }
         Recipe::Pluck { note, band } => {
@@ -394,7 +497,8 @@ pub fn render_recipe(recipe: &Recipe) -> Vec<f32> {
                         * amp
                         * (-t * (2.2 + harmonic as f32 * 1.1)).exp();
                 }
-                *s = v * 0.22 * (0.7 + 0.3 * bright);
+                let out_gain = if *band == 0 { 0.33 } else { 0.31 };
+                *s = v * out_gain * (0.7 + 0.3 * bright);
             }
             buf
         }
@@ -438,6 +542,32 @@ mod tests {
             s.to_bits().hash(&mut h);
         }
         h.finish()
+    }
+
+    #[test]
+    fn prototype_levels_sit_in_a_musical_window() {
+        // Every stock sound must be clearly audible but never clip: peak in
+        // [0.3, 1.2]. Failures print the offender for recipe tuning.
+        let pool = AssetPool::generate();
+        let mut bad = Vec::new();
+        let mut table = Vec::new();
+        for asset in &pool.assets {
+            let peak = asset.pcm.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+            table.push(format!(
+                "{} peak {:.3} rms {:.3}",
+                asset.name,
+                peak,
+                rms(&asset.pcm)
+            ));
+            if !(0.3..=1.2).contains(&peak) {
+                bad.push(asset.name.clone());
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "out of window: {bad:?}\n{}",
+            table.join("\n")
+        );
     }
 
     #[test]

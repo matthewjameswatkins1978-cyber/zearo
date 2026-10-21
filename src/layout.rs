@@ -154,16 +154,16 @@ mod tests {
             }
         ));
         assert!(matches!(
-            layout.pad_action(9),
+            layout.pad_action(13),
             PadAction::Hit {
-                target: TargetId(9),
+                target: TargetId(13),
                 ..
             }
         ));
         assert_eq!(
-            layout.pad_action(10),
+            layout.pad_action(14),
             PadAction::None,
-            "only 10 voices mapped"
+            "only 14 voices mapped"
         );
         assert_eq!(layout.pad_action(64), PadAction::None, "outside the grid");
     }

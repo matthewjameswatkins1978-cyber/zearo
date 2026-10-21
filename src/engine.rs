@@ -733,7 +733,7 @@ mod tests {
         let cases: Vec<(Instrument, Vec<Probe>)> = vec![
             (
                 percussion_kit(&pool),
-                (0..10).map(|t| (TargetId(t), 60, vec![10, 100])).collect(),
+                (0..14).map(|t| (TargetId(t), 60, vec![10, 100])).collect(),
             ),
             (
                 snare9(&pool),

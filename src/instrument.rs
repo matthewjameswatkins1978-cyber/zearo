@@ -347,6 +347,10 @@ pub fn percussion_kit(pool: &AssetPool) -> Instrument {
             voice(7, "Rim", "rim", None),
             voice(8, "Shaker", "shaker", None),
             voice(9, "Crash", "crash", None),
+            voice(10, "Conga", "conga", None),
+            voice(11, "Cowbell", "cowbell", None),
+            voice(12, "Tambourine", "tambourine", None),
+            voice(13, "Woodblock", "woodblock_hi", None),
         ],
         asset_names: asset_names(pool),
     }
@@ -375,9 +379,9 @@ pub fn snare9(pool: &AssetPool) -> Instrument {
 
 /// C: small pitched multisample — 5 roots × 2 velocity bands, same core.
 pub fn pitched_pluck(pool: &AssetPool) -> Instrument {
-    let notes = [48u8, 53, 57, 60, 64];
-    // Ranges centered between roots.
-    let edges = [0u8, 51, 55, 59, 62, 127];
+    let notes = [36u8, 41, 48, 53, 57, 60, 64];
+    // Edges centered between roots; overlaps resolve to the lower range.
+    let edges = [0u8, 39, 45, 51, 55, 59, 62, 127];
     let ranges = notes
         .iter()
         .enumerate()

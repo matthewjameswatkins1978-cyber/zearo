@@ -9,12 +9,15 @@
 //! WASAPI is the supported Windows path for this milestone. ASIO needs the
 //! Steinberg SDK + clang and stays unclaimed until proven on the real iD22.
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rtrb::Consumer;
 
-use crate::engine::{Engine, Msg};
+use crate::engine::{Engine, Msg, Shared};
 use crate::pattern::{LiveViews, Sequencer};
 
 #[derive(Debug)]
@@ -48,10 +51,15 @@ pub struct OutputInfo {
 
 /// Prefer the Audient iD22; otherwise the system default (first listed).
 /// Pure: the policy is tested without touching hardware.
+/// Prefer the Audient iD22; among its outputs prefer the main monitor pair
+/// ("1/2"); otherwise the system default (first listed). Pure: the policy
+/// is unit-tested without touching hardware.
 pub fn rank_output(names: &[String]) -> Option<usize> {
-    names
+    let lower: Vec<String> = names.iter().map(|n| n.to_lowercase()).collect();
+    lower
         .iter()
-        .position(|n| n.to_lowercase().contains("id22"))
+        .position(|n| n.contains("id22") && n.contains("1/2"))
+        .or_else(|| lower.iter().position(|n| n.contains("id22")))
         .or(if names.is_empty() { None } else { Some(0) })
 }
 
@@ -95,17 +103,51 @@ pub fn probe_output() -> Result<OutputInfo, AudioError> {
 pub struct RunningAudio {
     _stream: cpal::Stream,
     pub info: OutputInfo,
+    /// Stream errors observed in callbacks (xruns, device faults).
+    pub errors: Arc<AtomicU64>,
 }
 
-/// Open the preferred output, retune the engine + transport to the real
-/// device rate, and start the callback. The callback owns the engine and
-/// sequencer; the UI keeps the message producer and live views.
+impl RunningAudio {
+    pub fn error_count(&self) -> u64 {
+        self.errors.load(Ordering::Relaxed)
+    }
+}
+
+/// One sounding track handed to the audio thread.
+pub struct LiveTrack {
+    pub engine: Engine,
+    pub seq: Sequencer,
+    pub msgs: Consumer<Msg>,
+    pub shared: Arc<Shared>,
+}
+
+/// Open the preferred output for a single track. See [`start_multi`].
 pub fn start(
-    mut engine: Engine,
-    mut seq: Sequencer,
-    mut msgs: Consumer<Msg>,
+    engine: Engine,
+    seq: Sequencer,
+    msgs: Consumer<Msg>,
     views: Arc<LiveViews>,
+    shared: Arc<Shared>,
 ) -> Result<RunningAudio, AudioError> {
+    start_multi(
+        vec![LiveTrack {
+            engine,
+            seq,
+            msgs,
+            shared,
+        }],
+        vec![views],
+    )
+}
+
+/// Open the preferred output, retune every engine + transport to the real
+/// device rate, and start the callback. Tracks mix additively; the callback
+/// owns them while the UI keeps producers, shared handles and live views.
+pub fn start_multi(
+    mut tracks: Vec<LiveTrack>,
+    views: Vec<Arc<LiveViews>>,
+) -> Result<RunningAudio, AudioError> {
+    assert_eq!(tracks.len(), views.len(), "one view set per track");
     let host = cpal::default_host();
     let host_name = format!("{:?}", host.id());
     let mut listed = output_names(&host)?;
@@ -122,46 +164,90 @@ pub fn start(
     let channels = supported.channels();
     let config: cpal::StreamConfig = supported.into();
 
-    engine.set_device_rate(sample_rate as f32);
-    seq.transport.sample_rate = f64::from(sample_rate);
+    for track in &mut tracks {
+        track.engine.set_device_rate(sample_rate as f32);
+        track.seq.transport.sample_rate = f64::from(sample_rate);
+    }
+
+    let errors = Arc::new(AtomicU64::new(0));
+    let err_count = Arc::clone(&errors);
 
     // Reused scratch buffers: grown rarely, never per-frame allocated in
-    // steady state.
+    // steady state. Master accumulates the track mix.
     let mut scratch_l = Vec::<f32>::new();
     let mut scratch_r = Vec::<f32>::new();
+    let mut master_l = Vec::<f32>::new();
+    let mut master_r = Vec::<f32>::new();
     let stream = device
         .build_output_stream(
             config,
             move |data: &mut [f32], _| {
                 let frames = data.len() / channels.max(1) as usize;
-                if scratch_l.len() < frames {
-                    scratch_l.resize(frames, 0.0);
-                    scratch_r.resize(frames, 0.0);
+                for buf in [&mut scratch_l, &mut scratch_r, &mut master_l, &mut master_r] {
+                    if buf.len() < frames {
+                        buf.resize(frames, 0.0);
+                    }
                 }
-                seq.process_block(
-                    &mut engine,
-                    &mut msgs,
-                    &mut scratch_l[..frames],
-                    &mut scratch_r[..frames],
-                );
-                seq.publish(&views);
+                for m in master_l[..frames]
+                    .iter_mut()
+                    .chain(master_r[..frames].iter_mut())
+                {
+                    *m = 0.0;
+                }
+                for (ti, track) in tracks.iter_mut().enumerate() {
+                    track.engine.sync(&track.shared);
+                    track.seq.process_block(
+                        &mut track.engine,
+                        &mut track.msgs,
+                        &mut scratch_l[..frames],
+                        &mut scratch_r[..frames],
+                    );
+                    track.seq.publish(&views[ti]);
+                    views[ti]
+                        .dropped
+                        .store(track.engine.retired_dropped, Ordering::Relaxed);
+                    for i in 0..frames {
+                        master_l[i] += scratch_l[i];
+                        master_r[i] += scratch_r[i];
+                    }
+                }
+                let mut peak = 0.0f32;
+                for i in 0..frames {
+                    let a = master_l[i].abs();
+                    let b = master_r[i].abs();
+                    if a > peak {
+                        peak = a;
+                    }
+                    if b > peak {
+                        peak = b;
+                    }
+                }
+                if !views.is_empty() {
+                    let prev = f32::from_bits(views[0].peak_bits.load(Ordering::Relaxed));
+                    if peak > prev {
+                        views[0].peak_bits.store(peak.to_bits(), Ordering::Relaxed);
+                    }
+                }
                 match channels {
                     1 => {
                         for (i, frame) in data.iter_mut().enumerate() {
-                            *frame = scratch_l[i];
+                            *frame = master_l[i];
                         }
                     }
                     _ => {
                         for (i, frame) in data.chunks_mut(channels as usize).enumerate() {
-                            frame[0] = scratch_l[i];
+                            frame[0] = master_l[i];
                             if frame.len() > 1 {
-                                frame[1] = scratch_r[i];
+                                frame[1] = master_r[i];
                             }
                         }
                     }
                 }
             },
-            |err| eprintln!("zearo audio error: {err}"),
+            move |err| {
+                eprintln!("zearo audio error: {err}");
+                err_count.fetch_add(1, Ordering::Relaxed);
+            },
             None,
         )
         .map_err(|e| AudioError::Stream(e.to_string()))?;
@@ -176,6 +262,7 @@ pub fn start(
             sample_rate,
             channels,
         },
+        errors,
     })
 }
 
@@ -189,6 +276,16 @@ mod tests {
             "Realtek Digital Output (Realtek(R) Audio)".to_string(),
             "Output 1/2 (Audient iD22)".to_string(),
             "1 - VG27A (AMD High Definition Audio Device)".to_string(),
+        ];
+        assert_eq!(rank_output(&names), Some(1));
+    }
+
+    #[test]
+    fn prefers_main_monitor_pair() {
+        let names = vec![
+            "Output 9/10 (Audient iD22)".to_string(),
+            "Output 1/2 (Audient iD22)".to_string(),
+            "Speakers".to_string(),
         ];
         assert_eq!(rank_output(&names), Some(1));
     }

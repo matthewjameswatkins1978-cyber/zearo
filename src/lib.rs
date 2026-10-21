@@ -5,6 +5,7 @@
 //! and audio/MIDI device enumeration (`cpal`, `midir`).
 
 use cpal::traits::{DeviceTrait, HostTrait};
+pub mod app;
 pub mod audio;
 pub mod engine;
 pub mod instrument;

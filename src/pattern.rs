@@ -6,7 +6,7 @@
 //! audio frames. Timing derives from the audio clock, never the frame rate.
 
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU32, AtomicU64, Ordering},
     Arc,
 };
 
@@ -163,6 +163,13 @@ impl Transport {
 pub struct LiveViews {
     pub pattern: ArcSwap<Pattern>,
     pub published_rev: AtomicU64,
+    /// Latest transport tick (audio clock, polled for display only).
+    pub tick: AtomicU64,
+    /// Buffers dropped inline on the audio thread (should stay zero).
+    pub dropped: AtomicU64,
+    /// Peak master level observed since the last read (UI/demo meter).
+    /// Stored as f32 bits; the callback keeps the maximum.
+    pub peak_bits: AtomicU32,
 }
 
 impl LiveViews {
@@ -170,7 +177,15 @@ impl LiveViews {
         Self {
             pattern: ArcSwap::from(Arc::new(pattern.clone())),
             published_rev: AtomicU64::new(pattern.rev),
+            tick: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
+            peak_bits: AtomicU32::new(0),
         }
+    }
+
+    /// Read and reset the peak meter.
+    pub fn take_peak(&self) -> f32 {
+        f32::from_bits(self.peak_bits.swap(0, Ordering::Relaxed))
     }
 }
 
@@ -246,9 +261,13 @@ impl Sequencer {
         self.transport.bpm = bpm.clamp(30.0, 300.0);
     }
 
-    /// Publish a display snapshot when the pattern changed. Called from the
-    /// audio thread after each block; cheap when nothing changed.
+    /// Publish a display snapshot when the pattern changes, and always the
+    /// current tick for the playhead. Called from the audio thread after
+    /// each block; cheap when nothing changed.
     pub fn publish(&self, views: &LiveViews) {
+        views
+            .tick
+            .store(self.transport.tick as u64, Ordering::Relaxed);
         let rev = self.pattern.rev;
         if views.published_rev.load(Ordering::Relaxed) != rev {
             views.pattern.store(Arc::new(self.pattern.clone()));
@@ -342,6 +361,27 @@ impl Sequencer {
                             (true, false) => ArmMode::Record,
                             (false, _) => ArmMode::Off,
                         };
+                    }
+                    Msg::Toggle {
+                        target,
+                        note,
+                        velocity,
+                        tick,
+                    } => {
+                        self.undo.checkpoint(&self.pattern);
+                        self.pattern.toggle(target, note, velocity, tick);
+                    }
+                    Msg::Remove { id } => {
+                        self.undo.checkpoint(&self.pattern);
+                        self.pattern.remove(id);
+                    }
+                    Msg::LoadPattern { pattern } => {
+                        self.undo.checkpoint(&self.pattern);
+                        self.pattern = pattern;
+                        self.pattern.rev += 1;
+                    }
+                    Msg::Audition { asset } => {
+                        engine.audition(asset);
                     }
                 }
             }

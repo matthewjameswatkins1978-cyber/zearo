@@ -28,10 +28,13 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo build --locked
 cargo test --locked
-cargo run --quiet          # headless probe: DSP + devices, no hardware needed
-cargo run --quiet -- --ui  # opens the minimal workbench window
+cargo run --locked --quiet -- --probe  # devices only, no hardware needed
+cargo run --locked --quiet -- --demo 2  # 2 bars on the preferred output
+cargo run --locked                      # desktop app (grid + recording)
 ```
 
-`cargo run` never requires audio/MIDI hardware: device lists may be empty
-and playback is not attempted. Opening a stream or sounding audio is a
-later milestone, verified on real hardware then.
+`--probe` never requires audio/MIDI hardware: device lists may be empty
+and no stream is opened. `--demo` and the app open the preferred output
+(iD22 main pair when present; WASAPI) — verified 2026-10-21 on the real
+iD22 at 48 kHz with zero stream errors. See `docs/LISTENING.md` for the
+human listening checklist and `docs/SETUP.md` for the setup record.

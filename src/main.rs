@@ -1,15 +1,31 @@
-//! `zearo` workbench probe binary.
+//! `zearo` binary: desktop app, headless probe, headless demo playback.
 //!
-//! Exercises the verified stack (DSP, ring buffer, audio/MIDI enumeration)
-//! and, with `--ui`, opens the minimal `egui` workbench window.
+//! - `zearo` → full app (8×8 grid, layouts, transport, recording)
+//! - `zearo --probe` → device enumeration only, no stream opened
+//! - `zearo --demo [bars]` → headless loop playback on the preferred output
+//!   with a stats report (automated audio-path proof, no display needed)
 
-use zearo::{
-    input_device_names, midi_input_names, output_device_names, render_sine, rms, rtrb_roundtrip,
-};
+use std::sync::Arc;
+
+use zearo::{input_device_names, midi_input_names, output_device_names, render_sine, rms};
 
 fn main() {
-    let with_ui = std::env::args().any(|arg| arg == "--ui");
+    match std::env::args().nth(1).as_deref() {
+        Some("--probe") => probe(),
+        Some("--demo") => demo(),
+        Some("--help" | "-h") => help(),
+        _ => zearo::app::run(),
+    }
+}
 
+fn help() {
+    println!("zearo — playable groovebox prototype");
+    println!("  zearo            desktop app (grid + layouts + transport)");
+    println!("  zearo --probe    list audio/MIDI devices, no stream");
+    println!("  zearo --demo [N] play the demo loop N bars headless (default 4)");
+}
+
+fn probe() {
     let wave = render_sine(1.0, 44100.0);
     println!(
         "dsp: rendered {:.3} s @ {:.0} Hz, {} channel(s), {} frames",
@@ -22,21 +38,9 @@ fn main() {
         "dsp: channel 0 rms = {:.6} (theory 0.707107)",
         rms(wave.channel(0))
     );
-
-    println!("rtrb: roundtrip(0.25) = {}", rtrb_roundtrip(0.25));
-
     print_list("audio outputs", &output_device_names());
     print_list("audio inputs", &input_device_names());
     print_list("midi inputs", &midi_input_names());
-
-    if with_ui {
-        if let Err(err) = run_ui() {
-            eprintln!("ui error: {err}");
-            std::process::exit(1);
-        }
-    } else {
-        println!("ui: skipped (pass --ui to open the workbench window)");
-    }
 }
 
 fn print_list(kind: &str, names: &[String]) {
@@ -50,25 +54,45 @@ fn print_list(kind: &str, names: &[String]) {
     }
 }
 
-#[derive(Default)]
-struct ZearoApp {
-    level: f32,
-}
-
-impl eframe::App for ZearoApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading("Zearo workbench");
-            ui.label("Rust-first groovebox stack is live.");
-            ui.add(egui::Slider::new(&mut self.level, 0.0..=1.0).text("monitor level"));
-        });
+fn demo() {
+    let bars: u32 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4)
+        .max(1);
+    let (song, pool) = zearo::app::demo_project();
+    let (live, mut handles) = zearo::app::spawn_all(&song, &pool);
+    let views: Vec<Arc<zearo::pattern::LiveViews>> =
+        handles.iter().map(|h| Arc::clone(&h.views)).collect();
+    match zearo::audio::start_multi(live, views) {
+        Ok(running) => {
+            println!(
+                "zearo demo: {} @ {} Hz, {} ch",
+                running.info.name, running.info.sample_rate, running.info.channels
+            );
+            for h in &mut handles {
+                let _ = h.msg_tx.push(zearo::engine::Msg::Play);
+            }
+            let bar_secs = 60.0 / song.bpm * 4.0;
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_secs_f64(bar_secs * f64::from(bars) + 2.0);
+            let mut retired = 0u64;
+            let mut peak = 0.0f32;
+            while std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                for h in &mut handles {
+                    retired += zearo::engine::drain_retired(&mut h.retire_rx) as u64;
+                    peak = peak.max(h.views.take_peak());
+                }
+            }
+            println!(
+                "zearo demo: played {bars} bars + tail; retired {retired} buffers; peak {peak:.3}; stream errors: {}",
+                running.error_count()
+            );
+        }
+        Err(e) => {
+            eprintln!("zearo demo: audio failed: {e}");
+            std::process::exit(1);
+        }
     }
-}
-
-fn run_ui() -> eframe::Result<()> {
-    eframe::run_native(
-        "Zearo workbench",
-        eframe::NativeOptions::default(),
-        Box::new(|_cc| Ok(Box::new(ZearoApp::default()) as Box<dyn eframe::App>)),
-    )
 }

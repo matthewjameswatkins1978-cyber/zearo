@@ -19,6 +19,7 @@ use arc_swap::ArcSwap;
 use rtrb::{Consumer, Producer};
 
 use crate::instrument::{velocity_gain, Instrument, TargetId};
+use crate::pattern::Pattern;
 use crate::sample::{AssetId, AssetPool};
 
 /// Maximum simultaneous voices. This is polyphony headroom, not a limit on
@@ -38,7 +39,9 @@ pub const TRIGGER_CAPACITY: usize = 1024;
 pub struct PreparedZone {
     pub lo: u8,
     pub hi: u8,
-    pub takes: Vec<Arc<Vec<f32>>>,
+    /// (stable id, shared sample buffer). The id survives swaps so the UI
+    /// can audition and replace individual takes.
+    pub takes: Vec<(AssetId, Arc<Vec<f32>>)>,
 }
 
 pub struct PreparedRange {
@@ -49,7 +52,7 @@ pub struct PreparedRange {
 }
 
 pub enum PreparedSelector {
-    OneShot { source: Arc<Vec<f32>> },
+    OneShot { asset: AssetId, buf: Arc<Vec<f32>> },
     Velocity { zones: Vec<PreparedZone> },
     Pitched { ranges: Vec<PreparedRange> },
 }
@@ -74,6 +77,35 @@ pub struct PreparedInstrument {
 impl PreparedInstrument {
     pub fn target(&self, id: TargetId) -> Option<&PreparedTarget> {
         self.targets.iter().find(|t| t.id == id)
+    }
+
+    /// Find one concrete recording anywhere in the instrument.
+    pub fn find_buffer(&self, asset: AssetId) -> Option<Arc<Vec<f32>>> {
+        for t in &self.targets {
+            match &t.selector {
+                PreparedSelector::OneShot { asset: id, buf } if *id == asset => {
+                    return Some(Arc::clone(buf));
+                }
+                PreparedSelector::OneShot { .. } => {}
+                PreparedSelector::Velocity { zones } => {
+                    for z in zones {
+                        if let Some((_, buf)) = z.takes.iter().find(|(id, _)| *id == asset) {
+                            return Some(Arc::clone(buf));
+                        }
+                    }
+                }
+                PreparedSelector::Pitched { ranges } => {
+                    for r in ranges {
+                        for z in &r.zones {
+                            if let Some((_, buf)) = z.takes.iter().find(|(id, _)| *id == asset) {
+                                return Some(Arc::clone(buf));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Every (target, zone) key the engine must preallocate an RR counter for.
@@ -136,13 +168,20 @@ pub fn prepare(
                 .map(|z| PreparedZone {
                     lo: z.lo,
                     hi: z.hi,
-                    takes: z.takes.iter().filter_map(|id| take(*id, missing)).collect(),
+                    takes: z
+                        .takes
+                        .iter()
+                        .filter_map(|id| take(*id, missing).map(|buf| (*id, buf)))
+                        .collect(),
                 })
                 .collect()
         };
         let selector = match &t.selector {
             crate::instrument::Selector::OneShot { source } => match take(*source, &mut missing) {
-                Some(source) => PreparedSelector::OneShot { source },
+                Some(buf) => PreparedSelector::OneShot {
+                    asset: *source,
+                    buf,
+                },
                 None => continue,
             },
             crate::instrument::Selector::Velocity { zones } => PreparedSelector::Velocity {
@@ -189,7 +228,7 @@ pub fn prepare(
 /// Messages from the UI thread to the audio thread. Plain data only — the
 /// sequencer owns all musical state, so transport changes also travel here
 /// instead of touching shared state from the UI.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum Msg {
     Hit {
         target: TargetId,
@@ -210,6 +249,23 @@ pub enum Msg {
     SetArmed {
         armed: bool,
         overdub: bool,
+    },
+    Toggle {
+        target: TargetId,
+        note: u8,
+        velocity: u8,
+        tick: u64,
+    },
+    Remove {
+        id: u64,
+    },
+    LoadPattern {
+        pattern: Pattern,
+    },
+    /// Play one concrete recording directly, bypassing round-robin. Used
+    /// by the audition grid; never recorded into the pattern.
+    Audition {
+        asset: AssetId,
     },
 }
 
@@ -377,13 +433,13 @@ impl Engine {
             let level = t.level;
             let decay = t.decay;
             let (take, rate) = match &t.selector {
-                PreparedSelector::OneShot { source } => {
+                PreparedSelector::OneShot { buf, .. } => {
                     let rate = if t.pitch_tracking {
                         semitone_rate(note, t.root_note)
                     } else {
                         1.0
                     };
-                    (Arc::clone(source), rate)
+                    (Arc::clone(buf), rate)
                 }
                 PreparedSelector::Velocity { zones } => {
                     let found = zones
@@ -401,7 +457,8 @@ impl Engine {
                     if zone.takes.is_empty() {
                         return false;
                     }
-                    let take = Arc::clone(&zone.takes[*counter % zone.takes.len()]);
+                    let (_, buf) = &zone.takes[*counter % zone.takes.len()];
+                    let take = Arc::clone(buf);
                     *counter = counter.wrapping_add(1);
                     (take, 1.0)
                 }
@@ -430,7 +487,8 @@ impl Engine {
                     if zone.takes.is_empty() {
                         return false;
                     }
-                    let take = Arc::clone(&zone.takes[*counter % zone.takes.len()]);
+                    let (_, buf) = &zone.takes[*counter % zone.takes.len()];
+                    let take = Arc::clone(buf);
                     *counter = counter.wrapping_add(1);
                     (take, semitone_rate(note, range.root_note))
                 }
@@ -446,6 +504,17 @@ impl Engine {
     pub fn set_device_rate(&mut self, sample_rate: f32) {
         self.sample_rate = sample_rate;
         self.rate_factor = crate::sample::SAMPLE_RATE as f32 / sample_rate;
+    }
+
+    /// Play one concrete recording directly (audition grid). Bypasses
+    /// round-robin; never touches selectors or counters.
+    pub fn audition(&mut self, asset: AssetId) -> bool {
+        let buf = match self.prepared.find_buffer(asset) {
+            Some(buf) => buf,
+            None => return false,
+        };
+        self.start_voice(buf, 1.0, 0.9, 1.0, None);
+        true
     }
 
     /// Start one voice on a concrete buffer.

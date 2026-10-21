@@ -183,6 +183,8 @@ struct RecState {
     cap: crate::audio::InputCapture,
     acc: Vec<f32>,
     max_frames: usize,
+    t0: std::time::Instant,
+    peak: f32,
 }
 
 /// A finished take: original preserved, playback prepared separately.
@@ -548,6 +550,8 @@ impl ZearoApp {
                     cap,
                     acc: Vec::new(),
                     max_frames,
+                    t0: std::time::Instant::now(),
+                    peak: 0.0,
                 });
                 self.sample_status = format!("recording from {name} …");
             }
@@ -683,14 +687,25 @@ impl eframe::App for ZearoApp {
         }
         if self.recording.is_some() {
             let mut finished = false;
+            let mut meter = None;
             if let Some(rec) = self.recording.as_mut() {
                 while let Ok(chunk) = rec.cap.rx.try_recv() {
+                    for s in &chunk {
+                        let a = s.abs();
+                        if a > rec.peak {
+                            rec.peak = a;
+                        }
+                    }
                     rec.acc.extend_from_slice(&chunk);
                     if rec.acc.len() >= rec.max_frames {
                         finished = true;
                         break;
                     }
                 }
+                meter = Some((rec.t0.elapsed().as_secs_f32(), rec.peak));
+            }
+            if let Some((secs, peak)) = meter {
+                self.sample_status = format!("recording {secs:.1}s, peak {peak:.2} …");
             }
             if finished {
                 self.stop_take(true);
@@ -817,10 +832,18 @@ impl eframe::App for ZearoApp {
         });
 
         ui.horizontal(|ui| {
-            for (i, track) in self.song.tracks.iter().enumerate() {
-                let label = format!("{} {}", i + 1, track.name);
+            for i in 0..self.song.tracks.len() {
+                let (label, is_active) = {
+                    let t = &self.song.tracks[i];
+                    (format!("{} {}", i + 1, t.name), i == self.active)
+                };
+                let muted = self
+                    .handles
+                    .get(i)
+                    .map(|h| h.views.muted.load(Ordering::Relaxed))
+                    .unwrap_or(false);
                 let mut btn = egui::Button::new(label);
-                if i == self.active {
+                if is_active {
                     btn = btn.fill(egui::Color32::DARK_BLUE);
                 }
                 if ui.add(btn).clicked() {
@@ -829,6 +852,10 @@ impl eframe::App for ZearoApp {
                         .instrument
                         .as_ref()
                         .and_then(|inst| inst.targets.first().map(|t| t.id));
+                }
+                let mbtn = egui::Button::new(if muted { "M*" } else { "M" });
+                if ui.add(mbtn).clicked() {
+                    self.send_to(i, Msg::SetMuted { muted: !muted });
                 }
             }
         });
@@ -975,6 +1002,9 @@ impl ZearoApp {
     }
 
     fn ui_pads(&mut self, ui: &mut egui::Ui, layout: &Layout, now: f64) {
+        ui.horizontal(|ui| {
+            ui.add(egui::Slider::new(&mut self.velocity, 1..=127).text("pad velocity"));
+        });
         egui::Grid::new("pads").spacing([4.0, 4.0]).show(ui, |ui| {
             for row in 0..8 {
                 for col in 0..8 {

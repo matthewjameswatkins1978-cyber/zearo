@@ -6,7 +6,7 @@
 //! audio frames. Timing derives from the audio clock, never the frame rate.
 
 use std::sync::{
-    atomic::{AtomicU32, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     Arc,
 };
 
@@ -170,6 +170,8 @@ pub struct LiveViews {
     /// Peak master level observed since the last read (UI/demo meter).
     /// Stored as f32 bits; the callback keeps the maximum.
     pub peak_bits: AtomicU32,
+    /// Whether the track is muted (audio truth, polled for the M button).
+    pub muted: AtomicBool,
 }
 
 impl LiveViews {
@@ -180,6 +182,7 @@ impl LiveViews {
             tick: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             peak_bits: AtomicU32::new(0),
+            muted: AtomicBool::new(false),
         }
     }
 
@@ -243,6 +246,8 @@ pub struct Sequencer {
     pub pattern: Pattern,
     pub undo: UndoStack,
     pub arm: ArmMode,
+    /// Muted tracks keep time but make no sound.
+    pub muted: bool,
     scratch: Vec<(usize, usize)>,
 }
 
@@ -253,6 +258,7 @@ impl Sequencer {
             pattern,
             undo: UndoStack::default(),
             arm: ArmMode::Off,
+            muted: false,
             scratch: Vec::new(),
         }
     }
@@ -268,6 +274,7 @@ impl Sequencer {
         views
             .tick
             .store(self.transport.tick as u64, Ordering::Relaxed);
+        views.muted.store(self.muted, Ordering::Relaxed);
         let rev = self.pattern.rev;
         if views.published_rev.load(Ordering::Relaxed) != rev {
             views.pattern.store(Arc::new(self.pattern.clone()));
@@ -293,7 +300,7 @@ impl Sequencer {
 
         // Collect due events for this block (loop-aware, frame offsets).
         self.scratch.clear();
-        if self.transport.playing {
+        if self.transport.playing && !self.muted {
             let t0 = self.transport.tick;
             for (i, e) in self.pattern.events.iter().enumerate() {
                 let rel = (e.tick as f64 - t0).rem_euclid(len);
@@ -389,9 +396,16 @@ impl Sequencer {
                     Msg::ReleaseAll => {
                         engine.release_all();
                     }
+                    Msg::SetMuted { muted } => {
+                        self.muted = muted;
+                    }
                 }
             }
-            let (l, r) = engine.render_frame();
+            let (l, r) = if self.muted {
+                (0.0, 0.0)
+            } else {
+                engine.render_frame()
+            };
             left[f] = l;
             right[f] = r;
             if self.transport.playing {
@@ -513,6 +527,26 @@ mod tests {
         );
         let ratio = energy(&left2) / energy(&left).max(1e-9);
         assert!((ratio - 1.0).abs() < 0.05, "loop repeats, ratio {ratio}");
+    }
+
+    #[test]
+    fn muted_tracks_stay_silent_but_keep_time() {
+        let (mut seq, mut engine, _tx, _pool) = harness();
+        seq.pattern.add(TargetId(0), 60, 100, 0);
+        seq.muted = true;
+        let n = bar_frames();
+        let mut left = vec![0.0; n];
+        let mut right = vec![0.0; n];
+        let (_, mut msg_rx) = rtrb::RingBuffer::<Msg>::new(8);
+        seq.process_block(&mut engine, &mut msg_rx, &mut left, &mut right);
+        assert!(left.iter().all(|s| *s == 0.0), "muted means silent");
+        // A full bar elapsed: the loop wrapped, so time kept flowing.
+        assert!(seq.transport.tick < 1.0, "wrapped after one bar");
+        seq.muted = false;
+        let mut left = vec![0.0; n];
+        let mut right = vec![0.0; n];
+        seq.process_block(&mut engine, &mut msg_rx, &mut left, &mut right);
+        assert!(left.iter().any(|s| *s != 0.0), "unmute resumes sound");
     }
 
     #[test]

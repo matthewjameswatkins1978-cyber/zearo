@@ -33,6 +33,16 @@ cargo run --locked               # full desktop app (auto-plays the sketch)
 - [ ] Save, mess things up, load. Exact state restored?
 - [ ] Latency feel: live pads vs pattern — tight enough for finger drumming?
 
+## Sampling (One Shot foundations, v0.3.0)
+
+- [ ] MIDI: play the KeyStep into the kit (C1 maps across pads) and the pluck (chromatic). Velocities feel right? Note-offs damp ringing voices?
+- [ ] Record from the KeyStep with Record armed — timing matches what you played?
+- [ ] Import: drop a WAV in `imports/`, Refresh, load it onto a pad. Immediate and in tune with the kit?
+- [ ] Record a take from the iD22 input. Auto-trim sensible, level matched?
+- [ ] Trim start/end + Apply: does the edit do what you expect without clicks?
+- [ ] Take assigned to a new target survives save/load and still plays?
+- [ ] Mute buttons: mute a track mid-play — silent but the loop position holds?
+
 ## Known limits (this milestone)
 
 - WASAPI only; ASIO unproven (needs Steinberg SDK + clang).

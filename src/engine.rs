@@ -275,6 +275,10 @@ pub enum Msg {
     },
     /// Damp every ringing voice (panic button, device disconnect).
     ReleaseAll,
+    /// Mute or unmute a whole track (keeps time, makes no sound).
+    SetMuted {
+        muted: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------

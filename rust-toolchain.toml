@@ -1,0 +1,13 @@
+# Zearo toolchain pin.
+# Channel "stable" (verified as 1.99.0 on 2026-10-21) deliberately chosen over
+# an exact version pin so this project never forces a duplicate toolchain
+# download alongside the workshop's shared stable toolchain.
+# See docs/SETUP.md for verified versions.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+targets = [
+  "x86_64-pc-windows-msvc",
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+]

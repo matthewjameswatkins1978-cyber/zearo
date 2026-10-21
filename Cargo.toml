@@ -1,0 +1,34 @@
+[package]
+name = "zearo"
+version = "0.1.0"
+edition = "2021"
+description = "Zearo groovebox — Rust-first real-time audio/MIDI/DSP workbench"
+# No license selected yet. Public visibility is NOT an open-source grant;
+# see README.md. Do not add a license without reviewing licensing intentions.
+
+[lib]
+name = "zearo"
+crate-type = ["rlib"]
+
+[[bin]]
+name = "zearo"
+path = "src/main.rs"
+
+[dependencies]
+cpal = "0.18"
+midir = "0.11"
+fundsp = "0.23"
+eframe = "0.37"
+egui = "0.37"
+rtrb = "0.3"
+
+[dev-dependencies]
+criterion = "0.8"
+
+[[bench]]
+name = "dsp_bench"
+harness = false
+
+[profile.release]
+lto = true
+codegen-units = 1
